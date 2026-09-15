@@ -1,0 +1,34 @@
+# Work Diary
+
+I will be documenting my thought process and the general changes I have made, along with future plans and whatnot here.
+
+## 2026/9/13
+
+I started this project for a couple of reasons. First, I of course wanted a nice project for my resume. Second, I'm an AI major, so I figured that I should maybe have some more ML/AI related projects anyways. And third, I am a big Pokemon fan, and have wanted to get better at battling for a long time, but playing on the ladder is kind of anxiety-inducing. So, I wanted to solve that.
+
+I've set up a random double battles bot simply to test, and I found that it can do around 135 turns per second, which seems quite good as VGC battles take like 10 turns or so on average assuming that players know to some extent what they're doing. This means around 13 games per second.
+
+I have realized that this is probably a pretty difficult problem to try to tackle. There are simply SO many variables in competitive Pokemon, especially VGC doubles. Of course, this means two things: if I'm able to actually do it, it's all the more impressive, but at the same time, it will be difficult for me to adjust to the learning curve.
+
+## 2026/9/14
+
+I'm gonna start with training a very rudimentary agent. This agent will only really be able to make judgments based on Pokemon's moves, types, stat changes, and field effects. The expectation isn't for it to be *good* at battling, but I do expect that after training, it should be able to at least battle much better than just randomly selecting moves.
+
+I have created the rudimentary state encoder to encode the board state of the current turn, and my next steps will be to actually get an RL agent up and train it.
+
+## 2026/9/15
+
+Well, my next steps were *actually* to encode the action space and to create a kind of helper class to translate the Showdown states into tensors using the state encoder, and to translate the actions returned by the future RL agent into actions on Showdown. Apparently using a `gymnasium.env` is standard for this kind of thing. About the action space though, I think this is somewhat final already, as in, even in the non-simplified agent that I will make after this simplified one, the actions that the agent can possibly take on each turn won't change. I think it's just the observation space and encoded state that will be much more complex.
+
+I kinda wanna document my thought process in some more depth, especially as the action space probably won't change drastically. So initially, I was gonna just use something like a `[14, 14]` Multidiscrete after some digging, representing 14 actions for each Pokemon on the field, namely, 4 moves aimed at 3 potential targets (opponents and ally), plus 2 switches. However, after factoring in mega evolution, I realized that this wouldn't really cut it. Of course, I could've just switched to `[14, 2, 14, 2]` instead, but there was a problem with this: oftentimes for certain teams in VGC battles, especially at the high level, the move you click can depend on whether you mega evolve, and there are situations in which a Pokemon that *can* mega evolve doesn't do so. For example, if you bring both Charizard and Venusaur but end up mega evolving Venusaur, you obviously would be much less likely to click something like solar beam on Charizard, unless for some reason the sun is up anyways. So I thought you couldn't really decouple these things, and so switched to `[26, 26]`. Actually, I realize now that the moves that you click on each Pokemon also depend a good bit on what the other Pokemon clicks often, so I might even have to switch to just a purely discrete action space of like $26^2$, but since I have to rewrite or expand the encoder anyways, I think I'll just stick with what I have as a proof of concept before rewriting in the "real" implementation.
+
+Well I thought about it some more and I actually think I really want to switch, so I'm gonna switch. The thing is, there are just some absolutely disastrous situations that can happen if both Pokemon's moves are decided completely independently of each other. It's actually pretty easy to see why. Say for example that the board state looks something like this:
+
+|            |                      |
+|------------|----------------------|
+| Garchomp   | Floette-Eternal-Mega |
+| Baxcalibur | Froslass-Mega        |
+
+Let's say Froslass uses ice beam or some ice move into Garchomp, and Baxcalibur uses something like glaive rush into Garchomp (not the best example for various reasons, but it works). Froslass, being faster, knocks out the Garchomp, and Baxcalibur's glaive rush, being a dragon type move, does **NOTHING** after being redirected into the only opponent left, the fairy-type Floette. Of course, a real player would never do something like this (above a certain skill level), but the agent, if using a `[26, 26]` state space, is not capable of making the judgment that Froslass will knock out Garchomp, thus Baxcalibur shouldn't use a dragon type move (or double up into Garchomp at all); it simply sees "this move can knock out Garchomp and thus I should click it" for both Pokemon. So, I will be switching over to a normal `Discrete(676)` for the action space, which apparently isn't considered super big, and also the change in my code isn't as tedious as I thought it'd be (basically nothing even changes).
+
+Creating the actual environment isn't too bad once I figured out the requirements for overrides and whatnot, except I literally could not figure out how to deal with the async functions in `poke-env` and how to get the battle state each turn, so I asked an LLM and it came up with something I thought was pretty smart, which was to make use of the `get()` method of `queue` blocking until it can return something. Basically, upon the first turn (and every turn), Showdown calls `choose_move()` to get the orders from each player. So, for our agent, upon `choose_move()` is called, we want to immediately get the board state to encode before any orders are issued. So, we utilize two queues, one for the battle states, and one for the orders, each with max length of 1. Since `step()` in the environment is what issues the actual orders, when we get the orders in `choose_move()` with the `get()` method of the orders queue, it blocks until orders are issued. So, we just put the board state into its queue before returning the order queue `get()`. And, in `step()` (or `reset()` for the initial board state), we call `get()` on the board state queue, which blocks until `choose_move()` is called (i.e. the previous orders were executed and the new board state was calculated by Showdown). This ensures that the environment can get the most updated board state every turn. In order to actually implement this, a custom class that implements `poke-env.player.Player` has to be created that has a custom implementation for `choose_move()`.
