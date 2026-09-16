@@ -258,3 +258,5 @@ class VGCEnv(gym.Env):
         """
         Close the environment and clean up resources.
         """
+        # Do nothing as Python and the OS kernel will clean up the background thread and resources when the process exits.
+        pass
