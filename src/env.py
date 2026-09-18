@@ -1,6 +1,6 @@
 import poke_env.battle as pkmn_b
 from poke_env.player import Player, RandomPlayer
-from poke_env.player.battle_order import DoubleBattleOrder
+from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder, ForfeitBattleOrder, BattleOrder
 
 import gymnasium.spaces as spaces
 import gymnasium as gym
@@ -37,6 +37,35 @@ def get_slot_action_mask(battle: pkmn_b.DoubleBattle, slot_idx: int) -> list[boo
         an invalid action.
     """
     mask = [False] * 26
+    
+    if any(battle.force_switch):
+        if not battle.force_switch[slot_idx]:
+            # Pokemon still alive, must pass
+            mask[0] = True
+            return mask
+        else:
+            bench = [
+                pokemon for pokemon in battle.team.values() 
+                if pokemon is not None 
+                and not pokemon.fainted 
+                and pokemon not in battle.active_pokemon 
+                and pokemon.selected_in_teampreview
+            ]
+            available_switches = battle.available_switches[slot_idx]
+            
+            for action in range(24, 26):
+                switch_index = action - 24
+                if switch_index < len(bench) and bench[switch_index] in available_switches:
+                    mask[action] = True
+            
+            if all(battle.force_switch) and len(available_switches) == 1:
+                mask[0] = True
+            
+            if not any(mask):
+                mask[0] = True
+            
+            return mask
+    
     pokemon = battle.active_pokemon[slot_idx]
     
     if pokemon is None or pokemon.fainted:
@@ -65,7 +94,10 @@ def get_slot_action_mask(battle: pkmn_b.DoubleBattle, slot_idx: int) -> list[boo
     
     bench = [
         pokemon for pokemon in battle.team.values() 
-        if pokemon is not None and pokemon not in battle.active_pokemon and pokemon.selected_in_teampreview
+        if pokemon is not None 
+        and not pokemon.fainted 
+        and pokemon not in battle.active_pokemon 
+        and pokemon.selected_in_teampreview
     ]
     available_switches = battle.available_switches[slot_idx]
     
@@ -90,12 +122,33 @@ def action_to_double_order(player: Player, battle: pkmn_b.DoubleBattle, actions:
         DoubleBattleOrder: The double battle order for the given slot index.
     """
     orders = []
+    bench = [
+        pokemon for pokemon in battle.team.values() 
+        if pokemon is not None 
+        and not pokemon.fainted 
+        and pokemon not in battle.active_pokemon 
+        and pokemon.selected_in_teampreview
+    ]
     
     for slot_index, action in enumerate(actions):
+        if any(battle.force_switch):
+            # or is because both slots may be forced to switch with 1 remaining bench Pokemon, in which case one slot must pass
+            if not battle.force_switch[slot_index] or action == 0:
+                orders.append(PassBattleOrder())
+            else:
+                switch_index = action - 24
+                if 0 <= switch_index < len(bench) and bench[switch_index] in battle.available_switches[slot_index]:
+                    orders.append(player.create_order(bench[switch_index]))
+                elif battle.available_switches[slot_index]:
+                    orders.append(player.create_order(battle.available_switches[slot_index][0]))
+                else:
+                    orders.append(PassBattleOrder())
+            continue
+
         pokemon = battle.active_pokemon[slot_index]
         
         if pokemon is None or pokemon.fainted:
-            orders.append(None)  # No order for fainted Pokémon
+            orders.append(PassBattleOrder())  # No order for fainted Pokémon
             continue
         
         if action < 24:
@@ -104,15 +157,33 @@ def action_to_double_order(player: Player, battle: pkmn_b.DoubleBattle, actions:
             move_action = action % 12
             move_index = move_action // 3
             target_index = move_action % 3
-            target_position = get_target_position(target_index, slot_index == 0)
-            orders.append(player.create_order(order=moves[move_index], move_target=target_position, mega=is_mega))
+            # target_pos = get_target_position(target_index, slot_index == 0)
+            if move_index < len(moves):
+                move = moves[move_index]
+                # Check for spread move, field move, etc. since they want move_target=0
+                if move.target in [
+                    pkmn_b.Target.NORMAL, 
+                    pkmn_b.Target.ANY, 
+                    pkmn_b.Target.ADJACENT_FOE, 
+                    pkmn_b.Target.ADJACENT_ALLY, 
+                    pkmn_b.Target.ADJACENT_ALLY_OR_SELF
+                ]:
+                    target_pos = get_target_position(target_index, slot_index == 0)
+                else:
+                    target_pos = 0
+                orders.append(player.create_order(order=move, move_target=target_pos, mega=is_mega))
+            elif battle.available_moves[slot_index]:
+                orders.append(player.create_order(order=battle.available_moves[slot_index][0]))
+            else:
+                orders.append(PassBattleOrder())
         else:
             switch_index = action - 24
-            bench = [
-                pokemon for pokemon in battle.team.values() 
-                if pokemon is not None and pokemon not in battle.active_pokemon and pokemon.selected_in_teampreview
-            ]
-            orders.append(player.create_order(order=bench[switch_index]))
+            if 0 <= switch_index < len(bench) and bench[switch_index] in battle.available_switches[slot_index]:
+                orders.append(player.create_order(order=bench[switch_index]))
+            elif battle.available_switches[slot_index]:
+                orders.append(player.create_order(order=battle.available_switches[slot_index][0]))
+            else:
+                orders.append(PassBattleOrder())
             
     return DoubleBattleOrder(*orders)
 
@@ -125,22 +196,32 @@ class RLPlayer(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.battle_queue = queue.Queue(maxsize=1)
-        self.order_queue = queue.Queue(maxsize=1)
+        self.current_order_future: asyncio.Future | None = None
         
-    def choose_move(self, battle: pkmn_b.AbstractBattle) -> DoubleBattleOrder:
+    async def choose_move(self, battle: pkmn_b.AbstractBattle) -> DoubleBattleOrder:
         """
         Puts the current battle state into the queue and waits for the RL agent to provide an order. Because the battle is \
         put into the queue before the order is retrieved, this ensures that the RL agent always has the most up-to-date \
-        battle state when making a decision. Once the order is returned, Showdown will process the order and call \
-        choose_move again with the next battle state, etc.
+        battle state when making a decision.
         Args:
             battle (pkmn_b.AbstractBattle): The current battle state.
         Returns:
             DoubleBattleOrder: The Order object chosen by the RL agent.
         """
         assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
+        self.current_order_future = self.ps_client.loop.create_future()
         self.battle_queue.put(battle)
-        return self.order_queue.get()
+        return await self.current_order_future
+    
+    def receive_order(self, order: BattleOrder) -> None:
+        """
+        Receives the order from the RL agent and sets the result of the current_order_future. This unblocks the \
+        choose_move coroutine, allowing it to return the order to Showdown.
+        Args:
+            order (BattleOrder): The Order object chosen by the RL agent.
+        """
+        if self.current_order_future and not self.current_order_future.done():
+            self.ps_client.loop.call_soon_threadsafe(self.current_order_future.set_result, order)
     
     def _battle_finished_callback(self, battle: pkmn_b.AbstractBattle) -> None:
         """
@@ -185,6 +266,13 @@ class VGCEnv(gym.Env):
         mask = []
         slot_a_mask = get_slot_action_mask(self.current_battle, 0)
         slot_b_mask = get_slot_action_mask(self.current_battle, 1)
+        bench = [
+            pokemon for pokemon in self.current_battle.team.values() 
+            if pokemon is not None 
+            and not pokemon.fainted 
+            and pokemon not in self.current_battle.active_pokemon
+            and pokemon.selected_in_teampreview
+        ]
         
         for i in range(676):
             action_a = i // 26
@@ -192,6 +280,11 @@ class VGCEnv(gym.Env):
             is_legal = slot_a_mask[action_a] and slot_b_mask[action_b]
             # Prevent both slots from switching to the same Pokemon at the same time
             if action_a >= 24 and action_b >= 24 and action_a == action_b:
+                is_legal = False
+            # If forced to switch and there is a bench mon, don't allow both slots to pass (force one to switch)
+            if all(self.current_battle.force_switch) and len(bench) > 0 and action_a == 0 and action_b == 0:
+                is_legal = False
+            if (12 <= action_a < 24) and (12 <= action_b < 24):
                 is_legal = False
             mask.append(is_legal)
             
@@ -207,6 +300,17 @@ class VGCEnv(gym.Env):
             np.ndarray: The initial observation after resetting the environment.
         """
         super().reset(seed=seed)
+        # If the current battle is still ongoing, forfeit it to ensure a clean reset.
+        if hasattr(self, "current_battle") and self.current_battle and not self.current_battle.finished:
+            self.agent.receive_order(ForfeitBattleOrder())
+        
+        # Flush leftover battles from auto-resets after evaluation environment resets in training
+        while not self.agent.battle_queue.empty():
+            try:
+                self.agent.battle_queue.get_nowait()
+            except queue.Empty:
+                break
+        
         # Safely runs the async battle in the background thread of poke-env. This ensures that we don't need an async signature 
         # on the reset method, which is not supported by Gymnasium.
         asyncio.run_coroutine_threadsafe(
@@ -230,10 +334,16 @@ class VGCEnv(gym.Env):
             tuple[np.ndarray, float, bool, bool, dict[str, Any]]: A tuple containing the next observation, reward, \
             done flag (did the battle end?), truncated flag, and additional info.
         """
+        if self.current_battle.turn >= 30:
+            self.agent.receive_order(ForfeitBattleOrder())
+            self.current_battle = self.agent.battle_queue.get()
+            state = self.state_encoder.encode(self.current_battle).numpy()
+            return state, -1.0, True, True, {}
+        
         action_a = action // 26
         action_b = action % 26
         order = action_to_double_order(self.agent, self.current_battle, (action_a, action_b))
-        self.agent.order_queue.put(order)
+        self.agent.receive_order(order)
         
         # Wait for the next state of the battle after the action is processed.
         self.current_battle = self.agent.battle_queue.get()
@@ -251,8 +361,7 @@ class VGCEnv(gym.Env):
         Returns:
             float: The calculated reward.
         """
-        # Placeholder for reward calculation logic
-        return 0.0
+        return 1.0 if battle.won else -1.0 if battle.lost else 0.0
     
     def close(self) -> None:
         """

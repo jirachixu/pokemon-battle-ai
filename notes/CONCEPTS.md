@@ -30,7 +30,7 @@ One problem of early policy gradient algorithms (PPO is a policy gradient algori
 
 ### Advantage Function
 
-Another consideration of PPO is in how actions are rewarded. Specifically, actions shouldn't be rewarded simply because the outcome was good. In the Pokemon example, what if the agent blunders on turn 4 but wins the game on turn 8 because it was bailed out by a lucky crit, a flinch, etc.? This is where the advantage function $\hat{A}_t = Q(s_t, a_t) - V(s_t)$ comes into play. $Q(s_t, a_t)$ is the function that the expected reward of this *action*. The $Q$ function and the value function are related: $V^{\pi}(s) = \sum_{a \in A} \pi(a | s)Q^{\pi}(s, a)$. When the advantage function is greater than 0, the action was better than expected and should be made more likely, and vice versa for when it is less than 0. However, in the actor-critic method, $Q$ is unknown, and so the advantage function is calculated with an approximation using *generalized advantage estimation* (GAE). I won't dive into the mathematical details because it's probably not too useful for me currently; what's important is that there are two discount factors $\gamma$ and $\lambda$ (reward discount and bias-variance tradeoff) that are usually $0.99$ and $0.95$ respectively, and that GAE makes PPO resilient against noise (such as critical hits, flinches, accuracy, damage rolls, etc. in the case of Pokemon).
+Another consideration of PPO is in how actions are rewarded. Specifically, actions shouldn't be rewarded simply because the outcome was good. In the Pokemon example, what if the agent blunders on turn 4 but wins the game on turn 8 because it was bailed out by a lucky crit, a flinch, etc.? This is where the advantage function $\hat{A}_t = Q(s_t, a_t) - V(s_t)$ comes into play. $Q(s_t, a_t)$ is the function that the expected reward of this *action*. The $Q$ function and the value function are related: $V^{\pi}(s) = \sum_{a \in A} \pi(a | s)Q^{\pi}(s, a)$. When the advantage function is greater than 0, the action was better than expected and should be made more likely, and vice versa for when it is less than 0. However, in the actor-critic method, $Q$ is unknown, and so the advantage function is calculated with an approximation using *generalized advantage estimation* (GAE). I won't dive into the mathematical details because it's probably not too useful for me currently; what's important is that there are two discount factors $\gamma$ and $\lambda$ (reward discount and bias-variance tradeoff) that are usually $0.99$ and $0.95$ respectively, and that GAE makes PPO resilient against noise (such as critical hits, flinches, accuracy, damage rolls, etc. in the case of Pokemon). The environmental reward (scalar value returned by the reward function) is also used when calculating GAE.
 
 ### Loss Function
 
@@ -63,3 +63,12 @@ The total loss looks like this: $$\text{Loss}_{\text{total}}(\theta, \phi) = -\t
 | `ent_coef` ($c_2$) | $0.01$ | Weight of the curiosity / entropy bonus | Bot plays randomly and won't commit to lethal KOs | **Entropy Collapse:** Bot locks onto 1 move and stops exploring |
 | `vf_coef` ($c_1$) | $0.5$ | Weight of Critic loss in the total loss | Critic overpowers Actor; policy ignores move selection | Critic learns poorly; advantage estimates become inaccurate |
 | `max_grad_norm` | $0.5$ | Gradient clipping threshold | Exploding gradients on rare/unusual turn states | Gradients are truncated too heavily |
+
+## Reward Function Principles
+
+1. Winning must be strictly better than any loop, otherwise the agent will simply loop forever
+2. Don't reward states themselves, reward the change between states, otherwise the agent will loop forever
+3. Rewards and penalties should be symmetrical to avoid a kamikaze or coward agent
+4. Keep the range reasonable to avoid exploding gradients or gradient underflow (inability to distinguish noise)
+5. Consider whether an agent cheese the system by stalling or dying early on purpose
+6. Start simple before adding too many hyperparameters, otherwise it will be very difficult to tell what hyperparameter is causing undesirable behavior

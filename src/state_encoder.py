@@ -158,7 +158,10 @@ class StateEncoder:
         bench_tensors = []
         bench = [
             pokemon for pokemon in battle.team.values() 
-            if pokemon is not None and pokemon not in battle.active_pokemon and pokemon.selected_in_teampreview
+            if pokemon is not None 
+            and not pokemon.fainted 
+            and pokemon not in battle.active_pokemon 
+            and pokemon.selected_in_teampreview
         ]
         
         for pokemon in bench:
