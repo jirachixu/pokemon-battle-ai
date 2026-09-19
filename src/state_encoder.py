@@ -71,15 +71,15 @@ class StateEncoder:
 
         return speed_modifiers_tensor
 
-    def encode_moves(self, pokemon: pkmn_b.Pokemon) -> torch.Tensor:
+    def encode_moves(self, pokemon: pkmn_b.Pokemon, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
         """
-        Encode the moves of a Pokémon in the current turn of the battle.
+        Encode the moves of one own Pokemon in the current turn of the battle.
         Args:
-            pokemon (pkmn_b.Pokemon): The Pokémon object containing the current state.
+            pokemon (pkmn_b.Pokemon): The Pokemon object containing the current state.
         Returns:
-            torch.Tensor: A tensor representing the encoded moves of the Pokémon.
+            torch.Tensor: A tensor representing the encoded moves of the Pokemon.
         """
-        # [is_available (1), base_power (1), category (3), type (18)] = 23 features per move = 92 for 4
+        # [is_available (1), base_power (1), category (3), type (18), multiplier (2)] = 25 features per move = 100 for 4
         moves_tensors = []
         for move in pokemon.moves.values():
             # [physical, special, status]
@@ -89,21 +89,39 @@ class StateEncoder:
             move_type = torch.zeros(18, dtype=torch.float32)
             move_type[constants.TYPE_TO_IDX[move.type]] = 1.0
             
+            if pokemon in battle.active_pokemon:
+                opponent_pokemon = battle.opponent_active_pokemon
+            else:
+                opponent_pokemon = battle.active_pokemon
+            
+            opponent_1 = opponent_pokemon[0] if len(opponent_pokemon) > 0 else None
+            opponent_2 = opponent_pokemon[1] if len(opponent_pokemon) > 1 else None
+            
+            if move.category == pkmn_b.MoveCategory.STATUS or move.base_power == 0:
+                # Since status moves have a separate one-hot category encoding, they use a different set of weights.
+                # Thus, we can set them to 0 as a N/A value
+                mult_1 = 0.0
+                mult_2 = 0.0
+            else:
+                mult_1 = opponent_1.damage_multiplier(move.type) / 4.0 if (opponent_1 and not opponent_1.fainted) else 0.0
+                mult_2 = opponent_2.damage_multiplier(move.type) / 4.0 if (opponent_2 and not opponent_2.fainted) else 0.0
+            
             moves_tensor = torch.cat([
                 torch.tensor([0.0]) if move.current_pp == 0 else torch.tensor([1.0]),
                 torch.tensor([move.base_power / 150.0]),
                 category,
-                move_type
+                move_type,
+                torch.tensor([mult_1, mult_2], dtype=torch.float32)
             ])
             
             moves_tensors.append(moves_tensor)
         
         while len(moves_tensors) < 4:
-            moves_tensors.append(torch.zeros(23, dtype=torch.float32))
+            moves_tensors.append(torch.zeros(25, dtype=torch.float32))
         
         return torch.cat(moves_tensors)
 
-    def encode_single_pokemon(self, pokemon: pkmn_b.Pokemon | None) -> torch.Tensor:
+    def encode_single_pokemon(self, pokemon: pkmn_b.Pokemon | None, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
         """
         Generates the encoding vector for a Pokemon.
         Args:
@@ -111,9 +129,9 @@ class StateEncoder:
         Returns:
             torch.Tensor: The encoded tensor for the Pokemon.
         """
-        # [is_present, HP, types, status, boosts, moves, protected_last, is_mega] = 36 + 92 = 128 features    
+        # [is_present, HP, types, status, boosts, moves, protected_last, is_mega] = 36 + 100 = 136 features    
         if not pokemon:
-            return torch.zeros(128, dtype=torch.float32) # If the slot is empty
+            return torch.zeros(136, dtype=torch.float32) # If the slot is empty
         
         type_tensor = torch.zeros(18, dtype=torch.float32)
         
@@ -141,7 +159,7 @@ class StateEncoder:
             type_tensor,
             status_tensor,
             boost_tensor,
-            self.encode_moves(pokemon),
+            self.encode_moves(pokemon, battle),
             torch.tensor([did_protect, 1.0 if is_mega else 0.0])
         ])
         
@@ -194,8 +212,8 @@ class StateEncoder:
             self.encode_terrain(battle),
             self.encode_speed_modifiers(battle)
         ])
-        active_pokemon = torch.cat([self.encode_single_pokemon(pokemon) for pokemon in battle.active_pokemon])
-        opp_active_pokemon = torch.cat([self.encode_single_pokemon(pokemon) for pokemon in battle.opponent_active_pokemon])
+        active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.active_pokemon])
+        opp_active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.opponent_active_pokemon])
         bench = self.encode_bench(battle)
         return torch.cat([field_effects, active_pokemon, opp_active_pokemon, bench])
     

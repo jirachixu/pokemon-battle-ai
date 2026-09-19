@@ -58,3 +58,39 @@ Ok, there were actually quite a few bugs in implementation, some of them due to 
 The issue though, is that it's playing a `RandomPlayer`, which is pretty shit at the game, so it doesn't necessarily learn some of the best practices. For example, I noticed that it doesn't mega evolve very often, likely because it won without it anyways and thus never learned to do so. Thinking about it, mega evolution is kind of difficult because it can't be rewarded otherwise the agent would probably just mega evolve as soon as possible, but if it's not rewarded the agent would somehow have to just learn when to mega evolve.
 
 I ran the best model I got training against the `RandomPlayer` against a `SimpleHeuristicPlayer`, and as expected, it got destroyed. I tried training against it next and it kind of didn't really get better, so I think the reward and the state need to be made more complex. I'll probably start with the reward since it's easier and the current reward doesn't actually even reward anything other than winning or losing. Probably should start with rewarding knocking out Pokemon first. Also, the current agent doesn't actually know anything about type matchups, hence why it frequently clicks, for example, wood hammer into opposing steel or dragon types in the replays I watched, so I'd have to encode type matchups into the state.
+
+## 2026/9/18
+
+I'm going to update the reward function to include self and opponent fainting and train before doing anything else. I've read that it's a good idea to be incremental about these things, although I'm not exactly sure *how* incremental, but maybe this is more an art than a science. I also think I look into the future a little too much, or at least, too far sometimes, so I'm gonna try to be more in the moment about these things although doing so has led me to make poor design decisions in the past before in other projects that I later had to undo/redo.
+
+![Updated Reward Run](../graphs/reward_v2.png)
+
+The model struggled greatly against the `SimpleHeuristicPlayer` even after 100k turns of training. I think this is probably due to some limitations in the encoded state space, so I will try updating it with type matchup and training again.
+
+![Updated State Space](../graphs/state_space_v2.png)
+
+After 100k turns, it looks somewhat promising, as the evaluation mean reward doesn't show that steep drop at the end that the other one did. Upon evaluating for 100 episodes, I got the following results:
+
+```terminal
+Evaluating the trained model against a SimpleHeuristicsPlayer opponent...
+Record: 41W - 59L (41.0%)
+Mean Reward: -0.65
+Average Turns: 7.9
+```
+
+41% winrate is actually better than I expected. I think I can still squeeze performance out of this iteration of the agent, so I'm gonna try training for like 300000 more turns or something.
+
+After 300000 steps (starting from 80000, so 380000 steps) the results were as follows:
+
+![Updated State Space V2](../graphs/ssv2_expanded.png)
+
+And upon running the evaluation script, I got the following:
+
+```terminal
+Evaluating the trained model against a SimpleHeuristicsPlayer opponent...
+Record: 59W - 41L (59.0%)
+Mean Reward: -0.10
+Average Turns: 7.4
+```
+
+The mean reward seems to be beginning to plateau around here, so I think I'm gonna either expand the state space or tweak the reward function before running the next train loop. But 59% winrate up from how badly it got destroyed yesterday is pretty good so I'm somewhat satisfied for now.

@@ -250,7 +250,7 @@ class VGCEnv(gym.Env):
         self.opponent = opponent if opponent is not None else RandomPlayer(battle_format=self.battle_format)
         self.state_encoder = StateEncoder()
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(565,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(597,), dtype=np.float32
         )
         # action_a = action // 26, action_b = action % 26
         self.action_space = spaces.Discrete(676, dtype=np.int64)
@@ -320,7 +320,9 @@ class VGCEnv(gym.Env):
             self.agent.ps_client.loop
         )
         # Gets the initial state as soon as agent calls choose_move, which then blocks until the agent provides an order.
-        self.current_battle = self.agent.battle_queue.get()
+        self.current_battle: pkmn_b.DoubleBattle = self.agent.battle_queue.get()
+        self.num_opponent_alive = len([p for p in self.current_battle.opponent_team.values() if not p.fainted])
+        self.num_self_alive = len([p for p in self.current_battle.team.values() if not p.fainted])
         state = self.state_encoder.encode(self.current_battle).numpy()
         return state, {}
     
@@ -361,7 +363,17 @@ class VGCEnv(gym.Env):
         Returns:
             float: The calculated reward.
         """
-        return 1.0 if battle.won else -1.0 if battle.lost else 0.0
+        curr_opponent_alive = len([p for p in battle.opponent_team.values() if not p.fainted])
+        curr_self_alive = len([p for p in battle.team.values() if not p.fainted])
+        
+        reward = 0.0
+        reward += (self.num_self_alive - curr_self_alive) * -0.2
+        reward += (self.num_opponent_alive - curr_opponent_alive) * 0.2
+        
+        self.num_self_alive = curr_self_alive
+        self.num_opponent_alive = curr_opponent_alive
+        
+        return reward + 1.0 if battle.won else reward - 1.0 if battle.lost else reward
     
     def close(self) -> None:
         """
