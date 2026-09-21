@@ -19,7 +19,7 @@ eval_env_raw.agent.update_team(team=team)
 eval_env = Monitor(eval_env_raw)
 
 policy_kwargs = dict(
-    net_arch=dict(pi=[256, 256], vf=[256, 256])
+    net_arch=dict(pi=[512, 256], vf=[512, 256])
 )
 
 checkpoint_callback = CheckpointCallback(
@@ -34,27 +34,27 @@ eval_callback = MaskableEvalCallback(
     best_model_save_path="./checkpoints/best_model"
 )
 
-# model = MaskablePPO(
-#     "MlpPolicy",
-#     env,
-#     learning_rate=3e-4,
-#     n_steps=2048,
-#     batch_size=64,
-#     n_epochs=10,
-#     gamma=0.99,
-#     gae_lambda=0.95,
-#     clip_range=0.2,
-#     ent_coef=0.01,
-#     policy_kwargs=policy_kwargs,
-#     verbose=1,
-#     tensorboard_log="./logs/",
-#     device="cuda" if is_available() else "cpu"
-# )
-
-model = MaskablePPO.load(
-    "./checkpoints/best_model/best_model.zip",
-    device="cuda" if is_available() else "cpu",
-    env=env
+model = MaskablePPO(
+    "MlpPolicy",
+    env,
+    learning_rate=3e-4,
+    n_steps=2048,
+    batch_size=64,
+    n_epochs=10,
+    gamma=0.99,
+    gae_lambda=0.95,
+    clip_range=0.2,
+    ent_coef=0.01,
+    policy_kwargs=policy_kwargs,
+    verbose=1,
+    tensorboard_log="./logs/",
+    device="cuda" if is_available() else "cpu"
 )
 
-model.learn(total_timesteps=300000, callback=[checkpoint_callback, eval_callback], reset_num_timesteps=False)
+# model = MaskablePPO.load(
+#     "./checkpoints/best_model/best_model.zip",
+#     device="cuda" if is_available() else "cpu",
+#     env=env
+# )
+
+model.learn(total_timesteps=100000, callback=[checkpoint_callback, eval_callback])

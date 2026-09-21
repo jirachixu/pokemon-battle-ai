@@ -250,7 +250,7 @@ class VGCEnv(gym.Env):
         self.opponent = opponent if opponent is not None else RandomPlayer(battle_format=self.battle_format)
         self.state_encoder = StateEncoder()
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(597,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(1149,), dtype=np.float32
         )
         # action_a = action // 26, action_b = action % 26
         self.action_space = spaces.Discrete(676, dtype=np.int64)
@@ -321,9 +321,21 @@ class VGCEnv(gym.Env):
         )
         # Gets the initial state as soon as agent calls choose_move, which then blocks until the agent provides an order.
         self.current_battle: pkmn_b.DoubleBattle = self.agent.battle_queue.get()
-        self.num_opponent_alive = len([p for p in self.current_battle.opponent_team.values() if not p.fainted])
-        self.num_self_alive = len([p for p in self.current_battle.team.values() if not p.fainted])
+        opp_mons = [
+            p for p in self.current_battle.opponent_team.values() if p is not None 
+            and not p.fainted 
+            and p.selected_in_teampreview
+        ]
+        self_mons = [
+            p for p in self.current_battle.team.values() if p is not None 
+            and not p.fainted 
+            and p.selected_in_teampreview
+        ]
+        self.num_opponent_alive = len(opp_mons)
+        self.num_self_alive = len(self_mons)
         state = self.state_encoder.encode(self.current_battle).numpy()
+        self.opp_hp = sum(p.current_hp_fraction for p in opp_mons) if opp_mons else 0.0
+        self.self_hp = sum(p.current_hp_fraction for p in self_mons) if self_mons else 0.0
         return state, {}
     
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
@@ -363,15 +375,32 @@ class VGCEnv(gym.Env):
         Returns:
             float: The calculated reward.
         """
-        curr_opponent_alive = len([p for p in battle.opponent_team.values() if not p.fainted])
-        curr_self_alive = len([p for p in battle.team.values() if not p.fainted])
+        opp_mons = [
+            p for p in battle.opponent_team.values() if p is not None 
+            and not p.fainted 
+            and p.selected_in_teampreview
+        ]
+        self_mons = [
+            p for p in battle.team.values() if p is not None 
+            and not p.fainted 
+            and p.selected_in_teampreview
+        ]
+        
+        curr_opponent_alive = len(opp_mons)
+        curr_self_alive = len(self_mons)
+        curr_opp_hp = sum(p.current_hp_fraction for p in opp_mons) if opp_mons else 0.0
+        curr_self_hp = sum(p.current_hp_fraction for p in self_mons) if self_mons else 0.0
         
         reward = 0.0
         reward += (self.num_self_alive - curr_self_alive) * -0.2
         reward += (self.num_opponent_alive - curr_opponent_alive) * 0.2
+        reward += (curr_self_hp - self.self_hp) * 0.05 # if negative, punish
+        reward += (curr_opp_hp - self.opp_hp) * -0.05
         
         self.num_self_alive = curr_self_alive
         self.num_opponent_alive = curr_opponent_alive
+        self.self_hp = curr_self_hp
+        self.opp_hp = curr_opp_hp
         
         return reward + 1.0 if battle.won else reward - 1.0 if battle.lost else reward
     

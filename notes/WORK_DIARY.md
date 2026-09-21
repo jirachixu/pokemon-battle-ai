@@ -94,3 +94,11 @@ Average Turns: 7.4
 ```
 
 The mean reward seems to be beginning to plateau around here, so I think I'm gonna either expand the state space or tweak the reward function before running the next train loop. But 59% winrate up from how badly it got destroyed yesterday is pretty good so I'm somewhat satisfied for now.
+
+## 2026/9/20
+
+I think I'm gonna try to include the actual base stats for Pokemon on both sides in the state encoding now, since it's important to sometimes take out the more immediate offensive threat, and attacking into a super bulky Pokemon can also be suboptimal. The one problem I see with this is that encoding these base stats into the state could make the agent very resistant to adapting to different EV spreads, which cannot be seen. I'm also updating the bench encodings to fully make use of all the information in `encode_single_pokemon()`, as well as adding opponent bench encodings for the Pokemon that have been seen. I'm gonna train this before adding any of the ability/item feature extracting parts or anything like that. It's a bit unsatisfying now since the agent keeps improving for like hundreds of thousands of turns, so training takes like hours at a time on this laptop despite it having a 5070 ti, which means I can't actually make changes as often as I want to. Or maybe I could theoretically just cut off training early, but that also just feels kind of wrong and unsatisfying. It also seems to still be doing stupid things like u-turning against its own teammate. I'm not too sure why, though. Maybe I need to include damage in the reward. I'll do that after this run though. The coefficient on it should be small though, to prevent the agent from aggressively pursuing damage.
+
+![1149 Size State Space](../graphs/1149_state_space.png)
+
+So this model actually was worse than before, achieving only a peak 55% win rate. I'm not exactly sure why to be honest. I think I'll try to change the reward function as the moves that the agent chooses sometimes are still very subpar.
