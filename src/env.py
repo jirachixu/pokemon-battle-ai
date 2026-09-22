@@ -91,6 +91,9 @@ def get_slot_action_mask(battle: pkmn_b.DoubleBattle, slot_idx: int) -> list[boo
             mask[action] = True
             if battle.can_mega_evolve[slot_idx]:
                 mask[action + 12] = True
+        if move_index < len(moves) and moves[move_index].id == "fakeout" and not pokemon.first_turn:
+            mask[action] = False
+            mask[action + 12] = False
     
     bench = [
         pokemon for pokemon in battle.team.values() 
@@ -252,7 +255,6 @@ class VGCEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(1149,), dtype=np.float32
         )
-        # action_a = action // 26, action_b = action % 26
         self.action_space = spaces.Discrete(676, dtype=np.int64)
         
     def action_masks(self) -> np.ndarray:
@@ -287,7 +289,7 @@ class VGCEnv(gym.Env):
             if (12 <= action_a < 24) and (12 <= action_b < 24):
                 is_legal = False
             mask.append(is_legal)
-            
+        
         return np.array(mask, dtype=bool)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict[str, Any]]:
@@ -300,36 +302,54 @@ class VGCEnv(gym.Env):
             np.ndarray: The initial observation after resetting the environment.
         """
         super().reset(seed=seed)
-        # If the current battle is still ongoing, forfeit it to ensure a clean reset.
-        if hasattr(self, "current_battle") and self.current_battle and not self.current_battle.finished:
-            self.agent.receive_order(ForfeitBattleOrder())
-        
-        # Flush leftover battles from auto-resets after evaluation environment resets in training
-        while not self.agent.battle_queue.empty():
-            try:
-                self.agent.battle_queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        # Safely runs the async battle in the background thread of poke-env. This ensures that we don't need an async signature 
-        # on the reset method, which is not supported by Gymnasium.
-        asyncio.run_coroutine_threadsafe(
-            self.agent.battle_against(self.opponent, n_battles=1), 
-            # poke-env spawns a dedicated OS background thread, which is the ps_client.loop
-            # When Showdown sends a new battle state, it is processed in the ps_client.loop thread, which then calls choose_move.
-            self.agent.ps_client.loop
+        # Check if we can reuse the current battle (if it's still ongoing and it's the first turn)
+        can_reuse_battle = (
+            hasattr(self, "current_battle")
+            and self.current_battle is not None
+            and not self.current_battle.finished
+            and self.current_battle.turn <= 1
+            and self.agent.current_order_future is not None
+            and not self.agent.current_order_future.done()
         )
-        # Gets the initial state as soon as agent calls choose_move, which then blocks until the agent provides an order.
-        self.current_battle: pkmn_b.DoubleBattle = self.agent.battle_queue.get()
+        
+        if not can_reuse_battle:
+            # If a battle is unfinished mid-game, forfeit AND wait for Showdown to confirm it's closed
+            if hasattr(self, "current_battle") and self.current_battle and not self.current_battle.finished:
+                self.agent.receive_order(ForfeitBattleOrder())
+                try:
+                    while not self.current_battle.finished:
+                        b = self.agent.battle_queue.get(timeout=2.0)
+                        if b.battle_tag == self.current_battle.battle_tag:
+                            self.current_battle = b
+                except queue.Empty:
+                    pass
+            
+            # Flush any stale finished battles from the queue
+            while not self.agent.battle_queue.empty():
+                try:
+                    self.agent.battle_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            # Safely runs the async battle in the background thread of poke-env. This ensures that we don't need an async 
+            # signature on the reset method, which is not supported by Gymnasium.
+            asyncio.run_coroutine_threadsafe(
+                self.agent.battle_against(self.opponent, n_battles=1), 
+                # poke-env spawns a dedicated OS background thread, which is the ps_client.loop
+                # When Showdown sends a new battle state, it is processed in the ps_client.loop thread, 
+                # which then calls choose_move.
+                self.agent.ps_client.loop
+            )
+            # Gets the initial state as soon as agent calls choose_move, which then blocks until the agent provides an order.
+            self.current_battle: pkmn_b.DoubleBattle = self.agent.battle_queue.get()
+
         opp_mons = [
             p for p in self.current_battle.opponent_team.values() if p is not None 
             and not p.fainted 
-            and p.selected_in_teampreview
         ]
         self_mons = [
             p for p in self.current_battle.team.values() if p is not None 
             and not p.fainted 
-            and p.selected_in_teampreview
         ]
         self.num_opponent_alive = len(opp_mons)
         self.num_self_alive = len(self_mons)
@@ -356,15 +376,18 @@ class VGCEnv(gym.Env):
         
         action_a = action // 26
         action_b = action % 26
-        order = action_to_double_order(self.agent, self.current_battle, (action_a, action_b))
+
+        order = action_to_double_order(
+            self.agent, 
+            self.current_battle, 
+            (action_a, action_b)
+        )
         self.agent.receive_order(order)
-        
         # Wait for the next state of the battle after the action is processed.
         self.current_battle = self.agent.battle_queue.get()
-        state = self.state_encoder.encode(self.current_battle).numpy()
         reward = self.calculate_reward(self.current_battle)
         done = self.current_battle.finished
-        
+        state = self.state_encoder.encode(self.current_battle).numpy()
         return state, reward, done, False, {}
     
     def calculate_reward(self, battle: pkmn_b.DoubleBattle) -> float:
@@ -378,12 +401,10 @@ class VGCEnv(gym.Env):
         opp_mons = [
             p for p in battle.opponent_team.values() if p is not None 
             and not p.fainted 
-            and p.selected_in_teampreview
         ]
         self_mons = [
             p for p in battle.team.values() if p is not None 
             and not p.fainted 
-            and p.selected_in_teampreview
         ]
         
         curr_opponent_alive = len(opp_mons)

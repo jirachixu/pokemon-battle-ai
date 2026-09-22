@@ -154,7 +154,7 @@ class StateEncoder:
         species = pokemon.species.lower().replace("-", "").replace(" ", "")
         is_mega = (species.endswith(("mega", "megax", "megay", "megaz")) and species != "yanmega") or species.endswith("primal")
         
-        base_stats_tensor = torch.tensor(list(pokemon.base_stats.values()), dtype=torch.float32)
+        base_stats_tensor = torch.tensor(list(pokemon.base_stats.values()), dtype=torch.float32) / 150.0
         
         pkmn_tensor = torch.cat([
             torch.tensor([1.0, pokemon.current_hp_fraction]),
@@ -217,7 +217,6 @@ class StateEncoder:
             if pokemon is not None 
             and not pokemon.fainted 
             and pokemon not in battle.opponent_active_pokemon 
-            and pokemon.selected_in_teampreview
             and pokemon.revealed
         ]
         
@@ -246,6 +245,6 @@ class StateEncoder:
         active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.active_pokemon])
         opp_active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.opponent_active_pokemon])
         bench = self.encode_bench(battle)
-        opp_bench = self.encode_opponent_bench(battle)
+        opp_bench = self.encode_opponent_bench(battle)        
         return torch.cat([field_effects, active_pokemon, opp_active_pokemon, bench, opp_bench])
     

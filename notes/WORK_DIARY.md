@@ -102,3 +102,11 @@ I think I'm gonna try to include the actual base stats for Pokemon on both sides
 ![1149 Size State Space](../graphs/1149_state_space.png)
 
 So this model actually was worse than before, achieving only a peak 55% win rate. I'm not exactly sure why to be honest. I think I'll try to change the reward function as the moves that the agent chooses sometimes are still very subpar.
+
+## 2026/9/21
+
+Ok so actually, it seems that `opponent_pokemon.selected_in_teampreview` would always have a value of `False`, which meant that not only was my tweaked reward function wrong, but more importantly my encoding for the opponent's bench was *also* wrong and was returning a tensor full of 0s every time, which I have now fixed.
+
+![~500k iterations](../graphs/fixed_benches.png)
+
+This time, the agent managed to peak above 0 mean reward. This translated into 56% win rate, which was worse than the previous 59%, but was over 500 games instead of 100. I've also realized that the reward function is flawed; it currently rewards knocking out all opponents more than winning the game due to the HP rewards I added. I will fix this and train again to see if the results are better. I'm at the point where reaching the peak takes 2-3 hours per training run on my laptop, which is slow, but well I can't really do much about that.

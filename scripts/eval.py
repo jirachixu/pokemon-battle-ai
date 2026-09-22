@@ -23,7 +23,7 @@ print("Evaluating the trained model against a SimpleHeuristicsPlayer opponent...
 ep_rewards, ep_lengths = evaluate_policy(
     model,
     env,
-    n_eval_episodes=100,
+    n_eval_episodes=500,
     deterministic=True,
     return_episode_rewards=True
 )
