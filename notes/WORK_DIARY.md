@@ -110,3 +110,13 @@ Ok so actually, it seems that `opponent_pokemon.selected_in_teampreview` would a
 ![~500k iterations](../graphs/fixed_benches.png)
 
 This time, the agent managed to peak above 0 mean reward. This translated into 56% win rate, which was worse than the previous 59%, but was over 500 games instead of 100. I've also realized that the reward function is flawed; it currently rewards knocking out all opponents more than winning the game due to the HP rewards I added. I will fix this and train again to see if the results are better. I'm at the point where reaching the peak takes 2-3 hours per training run on my laptop, which is slow, but well I can't really do much about that.
+
+## 2026/9/22
+
+Ok, fixing and training led to a very high peak early on before it dipped and stagnated again. I think it's just time to add encodings for abilities and items now.
+
+I've done this (the abilities part only so far) with a `nn.Linear` feature extractor, which I've used instead of `nn.Embedding` as `nn.Embedding` can only take `torch.long` values, but there are times (in the fog of war) where a Pokemon's abilities have many possible values, and thus are represented as a uniform probability (`float`).
+
+![Abilities Added](../graphs/abilities.png)
+
+This training run ended up in pretty much the same place as before, again with a 56% winrate (well, 56.2; it won one more game) in 500 in eval. I'm not sure why it's stuck so hard at this mid-50s mark. Maybe adding item embeddings will help, but then again, I thought the same for abilities and it didn't. Maybe the model architecture just isn't good enough. And also maybe it's just because it's playing only a mirror matchup with a completely randomized team selection phase against a simple heuristic. Aside from the actual architecture, these other things don't seem too difficult to add/fix, so I'll try doing them. I think some look-ahead mechanism is also justifiable here since the agent doesn't really seem able to understand the longer-term consequences of its actions.

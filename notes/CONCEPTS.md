@@ -72,3 +72,7 @@ The total loss looks like this: $$\text{Loss}_{\text{total}}(\theta, \phi) = -\t
 4. Keep the range reasonable to avoid exploding gradients or gradient underflow (inability to distinguish noise)
 5. Consider whether an agent cheese the system by stalling or dying early on purpose
 6. Start simple before adding too many hyperparameters, otherwise it will be very difficult to tell what hyperparameter is causing undesirable behavior
+
+## Model vs. Algorithm
+
+PPO is the **algorithm** here. The **model** is the MLP layers, the weights, etc.

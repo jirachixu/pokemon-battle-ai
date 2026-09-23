@@ -2,9 +2,11 @@ from src.env import VGCEnv
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from stable_baselines3.common.monitor import Monitor
 from torch.cuda import is_available
-from poke_env.player import SimpleHeuristicsPlayer, RandomPlayer
+from poke_env.player import SimpleHeuristicsPlayer
+from src.models import VGCFeatureExtractor
 
 with open("teams/sample_team.txt", "r") as f:
     team = f.read().strip()
@@ -19,6 +21,9 @@ eval_env_raw.agent.update_team(team=team)
 eval_env = Monitor(eval_env_raw)
 
 policy_kwargs = dict(
+    features_extractor_class=VGCFeatureExtractor,
+    features_extractor_kwargs=dict(ability_dim=32),
+    # pi is the policy network (actor), vf is the value function (critic)
     net_arch=dict(pi=[512, 256], vf=[512, 256])
 )
 
@@ -35,7 +40,7 @@ eval_callback = MaskableEvalCallback(
 )
 
 # model = MaskablePPO(
-#     "MlpPolicy",
+#     MaskableMultiInputActorCriticPolicy,
 #     env,
 #     learning_rate=3e-4,
 #     n_steps=2048,
@@ -52,9 +57,10 @@ eval_callback = MaskableEvalCallback(
 # )
 
 model = MaskablePPO.load(
-    "./checkpoints/best_model/best_model.zip",
+    "./checkpoints/history/maskable_ppo_model_300000_steps.zip",
+    # "./checkpoints/best_model/best_model.zip",
     device="cuda" if is_available() else "cpu",
     env=env
 )
 
-model.learn(total_timesteps=200000, callback=[checkpoint_callback, eval_callback], reset_num_timesteps=False)
+model.learn(total_timesteps=300000, callback=[checkpoint_callback, eval_callback], reset_num_timesteps=False)

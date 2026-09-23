@@ -15,7 +15,7 @@ env_raw.agent.update_team(team=team)
 env = Monitor(env_raw)
 
 model = MaskablePPO.load(
-    "./checkpoints/best_model/best_model.zip",
+    "./checkpoints/history/maskable_ppo_model_600000_steps.zip",
     device="cuda" if is_available() else "cpu"
 )
 

@@ -1,6 +1,7 @@
 import poke_env.battle as pkmn_b
 import torch
 from src import constants
+import numpy as np
 
 class StateEncoder:
     def encode_weather(self, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
@@ -129,7 +130,7 @@ class StateEncoder:
         Returns:
             torch.Tensor: The encoded tensor for the Pokemon.
         """
-        # [is_present, HP, types, status, boosts, moves, protected_last, is_mega, base_stats] = 42 + 100 = 142 features    
+        # [is_present, HP, types, status, boosts, moves, protect_success_rate, is_mega, base_stats] = 42 + 100 = 142 features    
         if not pokemon:
             return torch.zeros(142, dtype=torch.float32) # If the slot is empty
         
@@ -148,8 +149,13 @@ class StateEncoder:
         boost_tensor = torch.zeros(7, dtype=torch.float32)
         for stat, boost in pokemon.boosts.items():
             boost_tensor[constants.BOOSTABLE_STAT_TO_IDX[stat]] = boost / 6.0  # Normalize to [-1, 1]
-        
-        did_protect = 1.0 if pokemon.last_move and pokemon.last_move.id in constants.PROTECT_MOVES else 0.0
+            
+        has_protect = any(
+            move.id in constants.PROTECT_MOVES 
+            for move in pokemon.moves.values() 
+            if move is not None
+        )
+        protect_success_rate = 0.0 if not has_protect else 1.0 / (3.0 ** pokemon.protect_counter)
             
         species = pokemon.species.lower().replace("-", "").replace(" ", "")
         is_mega = (species.endswith(("mega", "megax", "megay", "megaz")) and species != "yanmega") or species.endswith("primal")
@@ -162,7 +168,7 @@ class StateEncoder:
             status_tensor,
             boost_tensor,
             self.encode_moves(pokemon, battle),
-            torch.tensor([did_protect, 1.0 if is_mega else 0.0]),
+            torch.tensor([protect_success_rate, 1.0 if is_mega else 0.0]),
             base_stats_tensor
         ])
         
@@ -229,13 +235,86 @@ class StateEncoder:
 
         return torch.cat(bench_tensors)
     
-    def encode(self, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
+    def encode_single_ability(self, pokemon: pkmn_b.Pokemon | None) -> torch.Tensor:
+        """
+        Encodes a single Pokemon's ability into a 215-dim vector.
+        Args:
+            pokemon (pkmn_b.Pokemon): The Pokemon object to be encoded.
+        Returns:
+            torch.Tensor: A tensor representing the encoded ability of the Pokemon.
+        """
+        vec = torch.zeros(215, dtype=torch.float32)
+        if not pokemon or pokemon.fainted:
+            return vec
+
+        if pokemon.ability:
+            clean_name = pokemon.ability.lower().replace("-", "").replace(" ", "")
+            ability_idx = constants.ABILITY_TO_IDX.get(clean_name)
+            if ability_idx is not None:
+                vec[ability_idx] = 1.0
+            return vec
+
+        if pokemon.possible_abilities:
+            valid_indices = [
+                constants.ABILITY_TO_IDX[a.lower().replace("-", "").replace(" ", "")]
+                for a in pokemon.possible_abilities
+                if a.lower().replace("-", "").replace(" ", "") in constants.ABILITY_TO_IDX
+            ]
+            if valid_indices:
+                prob = 1.0 / len(valid_indices)
+                for a_idx in valid_indices:
+                    vec[a_idx] = prob
+
+        return vec
+
+    def encode_abilities(self, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
+        """
+        Encodes abilities of all active and bench Pokemon for both players into an 8x215 tensor in consistent order.
+        Args:
+            battle (pkmn_b.DoubleBattle): The battle object containing the current state.
+        Returns:
+            torch.Tensor: A tensor representing the encoded abilities of all relevant Pokemon.
+        """
+        abilities_tensor = torch.zeros((8, 215), dtype=torch.float32)
+
+        for i in range(2):
+            p1_mon = battle.active_pokemon[i] if i < len(battle.active_pokemon) else None
+            abilities_tensor[i] = self.encode_single_ability(p1_mon)
+
+            p2_mon = battle.opponent_active_pokemon[i] if i < len(battle.opponent_active_pokemon) else None
+            abilities_tensor[2 + i] = self.encode_single_ability(p2_mon)
+
+        own_bench = [
+            p for p in battle.team.values()
+            if p is not None
+            and not p.fainted
+            and p not in battle.active_pokemon
+            and p.selected_in_teampreview
+        ]
+        for i in range(2):
+            mon = own_bench[i] if i < len(own_bench) else None
+            abilities_tensor[4 + i] = self.encode_single_ability(mon)
+
+        opp_bench = [
+            p for p in battle.opponent_team.values()
+            if p is not None
+            and not p.fainted
+            and p not in battle.opponent_active_pokemon
+            and p.revealed
+        ]
+        for i in range(2):
+            mon = opp_bench[i] if i < len(opp_bench) else None
+            abilities_tensor[6 + i] = self.encode_single_ability(mon)
+
+        return abilities_tensor
+    
+    def encode(self, battle: pkmn_b.DoubleBattle) -> dict[str, np.ndarray]:
         """
         Generates the complete encoding vector for the current state of the battle.
         Args:
             battle (pkmn_b.DoubleBattle): The battle object containing the current state.
         Returns:
-            torch.Tensor: The complete encoded tensor for the battle state.
+            dict[str, np.ndarray]: The complete encoded arrays for the battle state.
         """
         field_effects = torch.cat([
             self.encode_weather(battle),
@@ -246,5 +325,8 @@ class StateEncoder:
         opp_active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.opponent_active_pokemon])
         bench = self.encode_bench(battle)
         opp_bench = self.encode_opponent_bench(battle)        
-        return torch.cat([field_effects, active_pokemon, opp_active_pokemon, bench, opp_bench])
+        return {
+            "numeric": torch.cat([field_effects, active_pokemon, opp_active_pokemon, bench, opp_bench]).numpy(),
+            "abilities": self.encode_abilities(battle).numpy()
+        }
     

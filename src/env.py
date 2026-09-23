@@ -252,9 +252,10 @@ class VGCEnv(gym.Env):
         self.agent = agent if agent is not None else RLPlayer(battle_format=self.battle_format)
         self.opponent = opponent if opponent is not None else RandomPlayer(battle_format=self.battle_format)
         self.state_encoder = StateEncoder()
-        self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(1149,), dtype=np.float32
-        )
+        self.observation_space = spaces.Dict({
+            "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1149,), dtype=np.float32),
+            "abilities": spaces.Box(low=0.0, high=1.0, shape=(8, 215), dtype=np.float32),
+        })
         self.action_space = spaces.Discrete(676, dtype=np.int64)
         
     def action_masks(self) -> np.ndarray:
@@ -292,14 +293,14 @@ class VGCEnv(gym.Env):
         
         return np.array(mask, dtype=bool)
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         """
         Reset the environment for a new battle.
         Args:
             seed (int | None): Optional seed for reproducibility.
             options (dict[str, Any] | None): Optional dictionary of additional options.
         Returns:
-            np.ndarray: The initial observation after resetting the environment.
+            dict[str, np.ndarray]: The initial observation after resetting the environment.
         """
         super().reset(seed=seed)
         # Check if we can reuse the current battle (if it's still ongoing and it's the first turn)
@@ -353,25 +354,25 @@ class VGCEnv(gym.Env):
         ]
         self.num_opponent_alive = len(opp_mons)
         self.num_self_alive = len(self_mons)
-        state = self.state_encoder.encode(self.current_battle).numpy()
+        state = self.state_encoder.encode(self.current_battle)
         self.opp_hp = sum(p.current_hp_fraction for p in opp_mons) if opp_mons else 0.0
         self.self_hp = sum(p.current_hp_fraction for p in self_mons) if self_mons else 0.0
         return state, {}
     
-    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    def step(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """
         An action is taken by the agent, which is converted into a DoubleBattleOrder and sent to the agent's order queue. \
         The environment then waits for the next state of the battle after the action is processed.
         Args:
             action (int): The action to take (0-675).
         Returns:
-            tuple[np.ndarray, float, bool, bool, dict[str, Any]]: A tuple containing the next observation, reward, \
+            tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]: A tuple containing the next observation, reward, \
             done flag (did the battle end?), truncated flag, and additional info.
         """
         if self.current_battle.turn >= 30:
             self.agent.receive_order(ForfeitBattleOrder())
             self.current_battle = self.agent.battle_queue.get()
-            state = self.state_encoder.encode(self.current_battle).numpy()
+            state = self.state_encoder.encode(self.current_battle)
             return state, -1.0, True, True, {}
         
         action_a = action // 26
@@ -387,7 +388,7 @@ class VGCEnv(gym.Env):
         self.current_battle = self.agent.battle_queue.get()
         reward = self.calculate_reward(self.current_battle)
         done = self.current_battle.finished
-        state = self.state_encoder.encode(self.current_battle).numpy()
+        state = self.state_encoder.encode(self.current_battle)
         return state, reward, done, False, {}
     
     def calculate_reward(self, battle: pkmn_b.DoubleBattle) -> float:
@@ -413,17 +414,17 @@ class VGCEnv(gym.Env):
         curr_self_hp = sum(p.current_hp_fraction for p in self_mons) if self_mons else 0.0
         
         reward = 0.0
-        reward += (self.num_self_alive - curr_self_alive) * -0.2
-        reward += (self.num_opponent_alive - curr_opponent_alive) * 0.2
-        reward += (curr_self_hp - self.self_hp) * 0.05 # if negative, punish
-        reward += (curr_opp_hp - self.opp_hp) * -0.05
+        reward += (self.num_self_alive - curr_self_alive) * -0.1
+        reward += (self.num_opponent_alive - curr_opponent_alive) * 0.1
+        reward += (curr_self_hp - self.self_hp) * 0.02 # if negative, punish
+        reward += (curr_opp_hp - self.opp_hp) * -0.02
         
         self.num_self_alive = curr_self_alive
         self.num_opponent_alive = curr_opponent_alive
         self.self_hp = curr_self_hp
         self.opp_hp = curr_opp_hp
         
-        return reward + 1.0 if battle.won else reward - 1.0 if battle.lost else reward
+        return reward + 2.0 if battle.won else reward - 2.0 if battle.lost else reward
     
     def close(self) -> None:
         """
