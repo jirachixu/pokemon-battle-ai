@@ -8,7 +8,7 @@ from torch.cuda import is_available
 from poke_env.player import SimpleHeuristicsPlayer
 from src.models import VGCFeatureExtractor
 
-with open("teams/sample_team.txt", "r") as f:
+with open("teams/MC306.txt", "r") as f:
     team = f.read().strip()
 
 opponent = SimpleHeuristicsPlayer(battle_format="gen9championsvgc2026regmc", team=team)

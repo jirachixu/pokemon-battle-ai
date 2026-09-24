@@ -255,6 +255,7 @@ class VGCEnv(gym.Env):
         self.observation_space = spaces.Dict({
             "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1149,), dtype=np.float32),
             "abilities": spaces.Box(low=0.0, high=1.0, shape=(8, 215), dtype=np.float32),
+            "items": spaces.Box(low=0.0, high=1.0, shape=(8, 167), dtype=np.float32),
         })
         self.action_space = spaces.Discrete(676, dtype=np.int64)
         

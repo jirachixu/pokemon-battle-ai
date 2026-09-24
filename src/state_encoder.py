@@ -2,6 +2,16 @@ import poke_env.battle as pkmn_b
 import torch
 from src import constants
 import numpy as np
+from src.item_priors import ITEM_PRIORS
+from src.damage_calc import evaluate_move_power_and_multipliers, get_move_type_and_bp_boost
+
+# Hook to detect used items
+_original_end_item = pkmn_b.Pokemon.end_item
+def _patched_end_item(self, item: str):
+    self.item = "none"
+    _original_end_item(self, item)
+
+pkmn_b.Pokemon.end_item = _patched_end_item
 
 class StateEncoder:
     def encode_weather(self, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
@@ -77,49 +87,46 @@ class StateEncoder:
         Encode the moves of one own Pokemon in the current turn of the battle.
         Args:
             pokemon (pkmn_b.Pokemon): The Pokemon object containing the current state.
+            battle (pkmn_b.DoubleBattle): The battle object containing the current state.
         Returns:
             torch.Tensor: A tensor representing the encoded moves of the Pokemon.
         """
-        # [is_available (1), base_power (1), category (3), type (18), multiplier (2)] = 25 features per move = 100 for 4
+        # [is_available (1), base_power (1), category (3), type (18), effective_damage (2)] = 25 features per move = 100 for 4
         moves_tensors = []
+        # If pokemon is ours, targets are opponents; if opponent, targets are ours
+        if pokemon in battle.active_pokemon or pokemon in battle.team.values():
+            targets = battle.opponent_active_pokemon
+        else:
+            targets = battle.active_pokemon
+
+        target_1 = targets[0] if len(targets) > 0 and targets[0] and not targets[0].fainted else None
+        target_2 = targets[1] if len(targets) > 1 and targets[1] and not targets[1].fainted else None
+        
         for move in pokemon.moves.values():
-            # [physical, special, status]
             category = torch.zeros(3, dtype=torch.float32)
             category[constants.CATEGORY_TO_IDX[move.category]] = 1.0
             
+            effective_type, _ = get_move_type_and_bp_boost(move, pokemon)
             move_type = torch.zeros(18, dtype=torch.float32)
-            move_type[constants.TYPE_TO_IDX[move.type]] = 1.0
-            
-            if pokemon in battle.active_pokemon:
-                opponent_pokemon = battle.opponent_active_pokemon
-            else:
-                opponent_pokemon = battle.active_pokemon
-            
-            opponent_1 = opponent_pokemon[0] if len(opponent_pokemon) > 0 else None
-            opponent_2 = opponent_pokemon[1] if len(opponent_pokemon) > 1 else None
-            
-            if move.category == pkmn_b.MoveCategory.STATUS or move.base_power == 0:
-                # Since status moves have a separate one-hot category encoding, they use a different set of weights.
-                # Thus, we can set them to 0 as a N/A value
-                mult_1 = 0.0
-                mult_2 = 0.0
-            else:
-                mult_1 = opponent_1.damage_multiplier(move.type) / 4.0 if (opponent_1 and not opponent_1.fainted) else 0.0
-                mult_2 = opponent_2.damage_multiplier(move.type) / 4.0 if (opponent_2 and not opponent_2.fainted) else 0.0
+            move_type[constants.TYPE_TO_IDX[effective_type]] = 1.0
+
+            nominal_bp, effective_damage_1, effective_damage_2 = evaluate_move_power_and_multipliers(
+                move, pokemon, target_1, target_2, battle
+            )
             
             moves_tensor = torch.cat([
                 torch.tensor([0.0]) if move.current_pp == 0 else torch.tensor([1.0]),
-                torch.tensor([move.base_power / 150.0]),
+                torch.tensor([nominal_bp / 150.0]),
                 category,
                 move_type,
-                torch.tensor([mult_1, mult_2], dtype=torch.float32)
+                torch.tensor([effective_damage_1, effective_damage_2], dtype=torch.float32)
             ])
             
             moves_tensors.append(moves_tensor)
-        
+
         while len(moves_tensors) < 4:
             moves_tensors.append(torch.zeros(25, dtype=torch.float32))
-        
+
         return torch.cat(moves_tensors)
 
     def encode_single_pokemon(self, pokemon: pkmn_b.Pokemon | None, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
@@ -127,6 +134,7 @@ class StateEncoder:
         Generates the encoding vector for a Pokemon.
         Args:
             pokemon (pkmn_b.Pokemon): The Pokemon object to be encoded.
+            battle (pkmn_b.DoubleBattle): The battle object containing the current state.
         Returns:
             torch.Tensor: The encoded tensor for the Pokemon.
         """
@@ -308,6 +316,90 @@ class StateEncoder:
 
         return abilities_tensor
     
+    def encode_single_item(self, pokemon: pkmn_b.Pokemon | None) -> torch.Tensor:
+        """
+        Encodes a single Pokemon's item.
+        Args:
+            pokemon (pkmn_b.Pokemon): The Pokemon object to be encoded.
+        Returns:
+            torch.Tensor: A tensor representing the encoded item of the Pokemon.
+        """
+        vec = torch.zeros(167, dtype=torch.float32)
+        if not pokemon or pokemon.fainted:
+            return vec
+        
+        if pokemon.item in ("none", ""):
+            vec[constants.ITEM_TO_IDX.get("none")] = 1.0
+            return vec
+
+        if pokemon.item:
+            clean_name = pokemon.item.lower().replace("-", "").replace(" ", "")
+            item_idx = constants.ITEM_TO_IDX.get(clean_name)
+            if item_idx is not None:
+                vec[item_idx] = 1.0
+            return vec
+
+        species = pokemon.species.lower().replace("-", "").replace(" ", "")
+        is_mega = (species.endswith(("mega", "megax", "megay", "megaz")) and species != "yanmega") or species.endswith("primal")
+        if is_mega:
+            mega_item = constants.MEGA_TO_MEGA_STONE.get(species)
+            if not mega_item:
+                return vec
+            item_idx = constants.ITEM_TO_IDX.get(mega_item)
+            if item_idx is not None:
+                vec[item_idx] = 1.0
+            return vec
+        
+        item_prior = ITEM_PRIORS.get(species, None)
+        if item_prior:
+            for item, prob in item_prior.items():
+                item_idx = constants.ITEM_TO_IDX.get(item)
+                if item_idx is not None:
+                    vec[item_idx] = prob
+
+        return vec
+    
+    def encode_items(self, battle: pkmn_b.DoubleBattle) -> torch.Tensor:
+        """
+        Encodes items of all active and bench Pokemon for both players into an 8x167 tensor in consistent order.
+        Args:
+            battle (pkmn_b.DoubleBattle): The battle object containing the current state.
+        Returns:
+            torch.Tensor: A tensor representing the encoded items of all relevant Pokemon.
+        """
+        items_tensor = torch.zeros((8, 167), dtype=torch.float32)
+
+        for i in range(2):
+            p1_mon = battle.active_pokemon[i] if i < len(battle.active_pokemon) else None
+            items_tensor[i] = self.encode_single_item(p1_mon)
+
+            p2_mon = battle.opponent_active_pokemon[i] if i < len(battle.opponent_active_pokemon) else None
+            items_tensor[2 + i] = self.encode_single_item(p2_mon)
+
+        own_bench = [
+            p for p in battle.team.values()
+            if p is not None
+            and not p.fainted
+            and p not in battle.active_pokemon
+            and p.selected_in_teampreview
+        ]
+        for i in range(2):
+            mon = own_bench[i] if i < len(own_bench) else None
+            items_tensor[4 + i] = self.encode_single_item(mon)
+
+        opp_bench = [
+            p for p in battle.opponent_team.values()
+            if p is not None
+            and not p.fainted
+            and p not in battle.opponent_active_pokemon
+            and p.revealed
+        ]
+        for i in range(2):
+            mon = opp_bench[i] if i < len(opp_bench) else None
+            items_tensor[6 + i] = self.encode_single_item(mon)
+
+        return items_tensor
+    
     def encode(self, battle: pkmn_b.DoubleBattle) -> dict[str, np.ndarray]:
         """
         Generates the complete encoding vector for the current state of the battle.
@@ -327,6 +419,7 @@ class StateEncoder:
         opp_bench = self.encode_opponent_bench(battle)        
         return {
             "numeric": torch.cat([field_effects, active_pokemon, opp_active_pokemon, bench, opp_bench]).numpy(),
-            "abilities": self.encode_abilities(battle).numpy()
+            "abilities": self.encode_abilities(battle).numpy(),
+            "items": self.encode_items(battle).numpy()
         }
     
