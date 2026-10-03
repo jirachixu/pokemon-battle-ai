@@ -190,30 +190,17 @@ class StateEncoder:
         Returns:
             torch.Tensor: The encoded tensor for the player's bench.
         """
-        bench_tensors = []
         bench = [
             pokemon for pokemon in battle.team.values() 
             if pokemon is not None 
             and not pokemon.fainted 
             and pokemon not in battle.active_pokemon 
-            and pokemon.selected_in_teampreview
+            and getattr(pokemon, "selected_in_teampreview", True)
         ]
-        
-        for pokemon in bench:
-            # type_tensor = torch.zeros(18, dtype=torch.float32)
-            # for pkmn_type in pokemon.types:
-            #     type_tensor[constants.TYPE_TO_IDX[pkmn_type]] = 1.0
-            # # 20 features
-            # bench_tensor = torch.cat([
-            #     torch.tensor([1.0]) if not pokemon.fainted else torch.tensor([0.0]),
-            #     torch.tensor([pokemon.current_hp_fraction]),
-            #     type_tensor
-            # ])
-            bench_tensor = self.encode_single_pokemon(pokemon, battle=battle)
-            bench_tensors.append(bench_tensor)
-            
-        while len(bench_tensors) < 2:
-            bench_tensors.append(torch.zeros(142, dtype=torch.float32))
+        bench_tensors = []
+        for i in range(2):
+            mon = bench[i] if i < len(bench) else None
+            bench_tensors.append(self.encode_single_pokemon(mon, battle=battle))
 
         return torch.cat(bench_tensors)
     
@@ -225,21 +212,17 @@ class StateEncoder:
         Returns:
             torch.Tensor: The encoded tensor for the opponent's bench.
         """
-        bench_tensors = []
         bench = [
             pokemon for pokemon in battle.opponent_team.values() 
             if pokemon is not None 
             and not pokemon.fainted 
             and pokemon not in battle.opponent_active_pokemon 
-            and pokemon.revealed
+            and getattr(pokemon, "revealed", False)
         ]
-        
-        for pokemon in bench:
-            bench_tensor = self.encode_single_pokemon(pokemon, battle=battle)
-            bench_tensors.append(bench_tensor)
-            
-        while len(bench_tensors) < 2:
-            bench_tensors.append(torch.zeros(142, dtype=torch.float32))
+        bench_tensors = []
+        for i in range(2):
+            mon = bench[i] if i < len(bench) else None
+            bench_tensors.append(self.encode_single_pokemon(mon, battle=battle))
 
         return torch.cat(bench_tensors)
     
@@ -413,8 +396,18 @@ class StateEncoder:
             self.encode_terrain(battle),
             self.encode_speed_modifiers(battle)
         ])
-        active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.active_pokemon])
-        opp_active_pokemon = torch.cat([self.encode_single_pokemon(pokemon, battle) for pokemon in battle.opponent_active_pokemon])
+        active_tensors = []
+        for i in range(2):
+            mon = battle.active_pokemon[i] if (hasattr(battle, "active_pokemon") and i < len(battle.active_pokemon)) else None
+            active_tensors.append(self.encode_single_pokemon(mon, battle=battle))
+        active_pokemon = torch.cat(active_tensors)
+
+        opp_active_tensors = []
+        for i in range(2):
+            mon = battle.opponent_active_pokemon[i] if (hasattr(battle, "opponent_active_pokemon") and i < len(battle.opponent_active_pokemon)) else None
+            opp_active_tensors.append(self.encode_single_pokemon(mon, battle=battle))
+        opp_active_pokemon = torch.cat(opp_active_tensors)
+
         bench = self.encode_bench(battle)
         opp_bench = self.encode_opponent_bench(battle)        
         return {

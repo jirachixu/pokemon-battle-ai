@@ -56,6 +56,63 @@ PROTECT_MOVES = {
     "burningbulwark",
 }
 
+STATUS_SUPPORT_MOVE_IDS = {
+    # Healing & Recovery
+    "recover", "roost", "slackoff", "softboiled", "milkdrink", "synthesis",
+    "moonlight", "morningsun", "strengthsap", "wish", "lifedew", "healpulse", "floralhealing", "healorder",
+    # Status Infliction
+    "spore", "sleeppowder", "hypnosis", "yawn", "willowisp", "thunderwave", "toxic", "glare", "stunspore",
+    # Disruption
+    "taunt", "encore", "disable", "haze", "torment", "destinybond",
+    # Redirection & Mitigation
+    "followme", "ragepowder", "allyswitch", "wideguard", "quickguard", "craftyshield",
+    # Speed & Field Control
+    "tailwind", "trickroom", "sunnyday", "raindance", "sandstorm", "snowscape", "gravity",
+    "electricterrain", "grassyterrain", "psychicterrain", "mistyterrain",
+    "reflect", "lightscreen", "auroraveil", "safeguard", "mist",
+    # Stat Setup
+    "swordsdance", "nastyplot", "calmmind", "dragondance", "bulkup", "quiverdance",
+    "irondefense", "acidarmor", "amnesia", "agility", "rockpolish", "autotomize",
+    "shiftgear", "shellsmash", "bellydrum", "tidyup", "victorydance", "clangoroussoul",
+    "geomancy", "coil", "growth", "workup", "cosmicpower", "defendorder", "cottonguard", "tailglow", "curse",
+    # Debuffs, Pivots & Buffs
+    "helpinghand", "coaching", "decorate", "partingshot", "chillyreception",
+    "faketears", "screech", "metalsound", "eerieimpulse", "scaryface", "charm",
+    "featherdance", "sweetscent", "tearfullook", "tickle", "howl", "aromaticmist", "spicyextract", "swagger", "flatter",
+    # Utility attacks with secondary drops
+    "clearsmog", "nuzzle", "mortalspin", "snarl", "electroweb", "icywind", "strugglebug",
+    # Protection & Substitutes
+    "substitute", "protect", "detect", "spikyshield", "banefulbunker", "kingsshield", "silktrap", "burningbulwark", "endure",
+    "fakeout",
+}
+
+SELF_OR_FIELD_MOVES = {
+    # Protect moves
+    "protect", "detect", "spikyshield", "banefulbunker", "kingsshield", "silktrap", "burningbulwark", "endure",
+    # Setup
+    "swordsdance", "nastyplot", "calmmind", "dragondance", "bulkup", "quiverdance",
+    "irondefense", "amnesia", "agility", "rockpolish", "autotomize", "shiftgear",
+    "shellsmash", "bellydrum", "tidyup", "victorydance", "clangoroussoul", "geomancy",
+    "coil", "growth", "workup", "cosmicpower", "defendorder", "cottonguard", "tailglow", "acidarmor", "barrier",
+    # Recovery
+    "recover", "roost", "slackoff", "softboiled", "milkdrink", "healorder", "wish", "synthesis", "moonlight",
+    "morningsun", "lifedew",
+    # Weather & Terrain & Field
+    "tailwind", "trickroom", "reflect", "lightscreen", "auroraveil", "safeguard", "mist",
+    "sunnyday", "raindance", "sandstorm", "snowscape", "hail", "gravity",
+    "psychicterrain", "electricterrain", "grassyterrain", "mistyterrain", "haze",
+    # Guards & Positioning
+    "wideguard", "quickguard", "craftyshield", "followme", "ragepowder", "allyswitch",
+    "chillyreception", "destinybond",
+    # Substitute & Status self
+    "substitute", "rest", "batonpass",
+}
+
+ALLY_TARGET_MOVES = {
+    "helpinghand", "coaching", "decorate", "healpulse", "floralhealing",
+    "aromaticmist", "howl", "lifedew", "spicyextract", "swagger", "flatter",
+}
+
 ABILITY_TO_IDX = {
     "adaptability": 0,
     "aerilate": 1,
@@ -669,4 +726,440 @@ TYPE_RESIST_BERRIES = {
     "babiriberry": pkmn_b.PokemonType.STEEL,
     "roseliberry": pkmn_b.PokemonType.FAIRY,
     "chilanberry": pkmn_b.PokemonType.NORMAL,
+}
+
+MEGA_SPECIES_STATS = {
+    "abomasnowmega": {
+        "types": ("grass", "ice"),
+        "ability": "snowwarning",
+        "base_stats": {"hp": 90, "atk": 132, "def": 105, "spa": 132, "spd": 105, "spe": 30},
+    },
+    "absolmega": {
+        "types": ("dark",),
+        "ability": "magicbounce",
+        "base_stats": {"hp": 65, "atk": 150, "def": 60, "spa": 115, "spd": 60, "spe": 115},
+    },
+    "absolmegaz": {
+        "types": ("dark", "ghost"),
+        "ability": "sharpness",
+        "base_stats": {"hp": 65, "atk": 154, "def": 60, "spa": 75, "spd": 60, "spe": 151},
+    },
+    "aerodactylmega": {
+        "types": ("rock", "flying"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 80, "atk": 135, "def": 85, "spa": 70, "spd": 95, "spe": 150},
+    },
+    "aggronmega": {
+        "types": ("steel",),
+        "ability": "filter",
+        "base_stats": {"hp": 70, "atk": 140, "def": 230, "spa": 60, "spd": 80, "spe": 50},
+    },
+    "alakazammega": {
+        "types": ("psychic",),
+        "ability": "trace",
+        "base_stats": {"hp": 55, "atk": 50, "def": 65, "spa": 175, "spd": 105, "spe": 150},
+    },
+    "altariamega": {
+        "types": ("dragon", "fairy"),
+        "ability": "pixilate",
+        "base_stats": {"hp": 75, "atk": 110, "def": 110, "spa": 110, "spd": 105, "spe": 80},
+    },
+    "ampharosmega": {
+        "types": ("electric", "dragon"),
+        "ability": "moldbreaker",
+        "base_stats": {"hp": 90, "atk": 95, "def": 105, "spa": 165, "spd": 110, "spe": 45},
+    },
+    "audinomega": {
+        "types": ("normal", "fairy"),
+        "ability": "healer",
+        "base_stats": {"hp": 103, "atk": 60, "def": 126, "spa": 80, "spd": 126, "spe": 50},
+    },
+    "banettemega": {
+        "types": ("ghost",),
+        "ability": "prankster",
+        "base_stats": {"hp": 64, "atk": 165, "def": 75, "spa": 93, "spd": 83, "spe": 75},
+    },
+    "barbaraclemega": {
+        "types": ("rock", "water"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 72, "atk": 140, "def": 135, "spa": 54, "spd": 106, "spe": 93},
+    },
+    "baxcaliburmega": {
+        "types": ("dragon", "ice"),
+        "ability": "snowwarning",
+        "base_stats": {"hp": 115, "atk": 165, "def": 112, "spa": 85, "spd": 106, "spe": 117},
+    },
+    "beedrillmega": {
+        "types": ("bug", "poison"),
+        "ability": "adaptability",
+        "base_stats": {"hp": 65, "atk": 150, "def": 40, "spa": 15, "spd": 80, "spe": 145},
+    },
+    "blastoisemega": {
+        "types": ("water",),
+        "ability": "megalauncher",
+        "base_stats": {"hp": 79, "atk": 103, "def": 120, "spa": 135, "spd": 115, "spe": 78},
+    },
+    "blazikenmega": {
+        "types": ("fire", "fighting"),
+        "ability": "speedboost",
+        "base_stats": {"hp": 80, "atk": 160, "def": 80, "spa": 130, "spd": 80, "spe": 100},
+    },
+    "cameruptmega": {
+        "types": ("fire", "ground"),
+        "ability": "sheerforce",
+        "base_stats": {"hp": 70, "atk": 120, "def": 100, "spa": 145, "spd": 105, "spe": 20},
+    },
+    "chandeluremega": {
+        "types": ("ghost", "fire"),
+        "ability": "shadowtag",
+        "base_stats": {"hp": 60, "atk": 65, "def": 110, "spa": 175, "spd": 110, "spe": 100},
+    },
+    "charizardmegax": {
+        "types": ("fire", "dragon"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 78, "atk": 130, "def": 111, "spa": 130, "spd": 85, "spe": 100},
+    },
+    "charizardmegay": {
+        "types": ("fire", "flying"),
+        "ability": "drought",
+        "base_stats": {"hp": 78, "atk": 104, "def": 78, "spa": 159, "spd": 115, "spe": 100},
+    },
+    "chesnaughtmega": {
+        "types": ("grass", "fighting"),
+        "ability": "bulletproof",
+        "base_stats": {"hp": 88, "atk": 137, "def": 152, "spa": 74, "spd": 105, "spe": 74},
+    },
+    "chimechomega": {
+        "types": ("psychic", "steel"),
+        "ability": "punkrock",
+        "base_stats": {"hp": 75, "atk": 50, "def": 90, "spa": 145, "spd": 110, "spe": 85},
+    },
+    "clefablemega": {
+        "types": ("fairy",),
+        "ability": "magicguard",
+        "base_stats": {"hp": 95, "atk": 70, "def": 103, "spa": 135, "spd": 120, "spe": 60},
+    },
+    "crabominablemega": {
+        "types": ("fighting", "ice"),
+        "ability": "furcoat",
+        "base_stats": {"hp": 97, "atk": 162, "def": 87, "spa": 62, "spd": 87, "spe": 83},
+    },
+    "delphoxmega": {
+        "types": ("fire", "psychic"),
+        "ability": "magicguard",
+        "base_stats": {"hp": 75, "atk": 69, "def": 92, "spa": 149, "spd": 130, "spe": 119},
+    },
+    "dragalgemega": {
+        "types": ("poison", "dragon"),
+        "ability": "adaptability",
+        "base_stats": {"hp": 65, "atk": 85, "def": 110, "spa": 137, "spd": 143, "spe": 54},
+    },
+    "dragonitemega": {
+        "types": ("dragon", "flying"),
+        "ability": "aerilate",
+        "base_stats": {"hp": 91, "atk": 164, "def": 115, "spa": 120, "spd": 120, "spe": 90},
+    },
+    "drampamega": {
+        "types": ("normal", "dragon"),
+        "ability": "berserk",
+        "base_stats": {"hp": 78, "atk": 60, "def": 115, "spa": 165, "spd": 121, "spe": 46},
+    },
+    "eelektrossmega": {
+        "types": ("electric",),
+        "ability": "eelevate",
+        "base_stats": {"hp": 85, "atk": 135, "def": 100, "spa": 135, "spd": 100, "spe": 60},
+    },
+    "emboarmega": {
+        "types": ("fire", "fighting"),
+        "ability": "rockhead",
+        "base_stats": {"hp": 110, "atk": 153, "def": 85, "spa": 120, "spd": 85, "spe": 75},
+    },
+    "excadrillmega": {
+        "types": ("ground", "steel"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 110, "atk": 165, "def": 80, "spa": 50, "spd": 85, "spe": 118},
+    },
+    "falinksmega": {
+        "types": ("fighting", "steel"),
+        "ability": "technician",
+        "base_stats": {"hp": 65, "atk": 130, "def": 120, "spa": 70, "spd": 80, "spe": 105},
+    },
+    "feraligatrmega": {
+        "types": ("water", "dragon"),
+        "ability": "dragonize",
+        "base_stats": {"hp": 85, "atk": 160, "def": 125, "spa": 89, "spd": 93, "spe": 78},
+    },
+    "floettemega": {
+        "types": ("fairy",),
+        "ability": "dazzling",
+        "base_stats": {"hp": 74, "atk": 65, "def": 87, "spa": 155, "spd": 148, "spe": 122},
+    },
+    "froslassmega": {
+        "types": ("ice", "ghost"),
+        "ability": "refrigerate",
+        "base_stats": {"hp": 70, "atk": 110, "def": 85, "spa": 110, "spd": 85, "spe": 120},
+    },
+    "gallademega": {
+        "types": ("psychic", "fighting"),
+        "ability": "innerfocus",
+        "base_stats": {"hp": 68, "atk": 165, "def": 95, "spa": 65, "spd": 115, "spe": 110},
+    },
+    "garchompmega": {
+        "types": ("dragon", "ground"),
+        "ability": "sandforce",
+        "base_stats": {"hp": 108, "atk": 170, "def": 115, "spa": 120, "spd": 95, "spe": 92},
+    },
+    "garchompmegaz": {
+        "types": ("dragon", "ground"),
+        "ability": "roughskin",
+        "base_stats": {"hp": 108, "atk": 160, "def": 115, "spa": 80, "spd": 95, "spe": 142},
+    },
+    "gardevoirmega": {
+        "types": ("psychic", "fairy"),
+        "ability": "pixilate",
+        "base_stats": {"hp": 68, "atk": 85, "def": 65, "spa": 165, "spd": 135, "spe": 100},
+    },
+    "gengarmega": {
+        "types": ("ghost", "poison"),
+        "ability": "shadowtag",
+        "base_stats": {"hp": 60, "atk": 65, "def": 80, "spa": 170, "spd": 95, "spe": 130},
+    },
+    "glaliemega": {
+        "types": ("ice",),
+        "ability": "refrigerate",
+        "base_stats": {"hp": 80, "atk": 120, "def": 80, "spa": 120, "spd": 80, "spe": 100},
+    },
+    "glimmoramega": {
+        "types": ("rock", "poison"),
+        "ability": "corrosion",
+        "base_stats": {"hp": 83, "atk": 65, "def": 110, "spa": 160, "spd": 101, "spe": 106},
+    },
+    "golisopodmega": {
+        "types": ("bug", "water"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 75, "atk": 155, "def": 150, "spa": 60, "spd": 115, "spe": 75},
+    },
+    "golurkmega": {
+        "types": ("ground", "ghost"),
+        "ability": "ironfist",
+        "base_stats": {"hp": 89, "atk": 154, "def": 110, "spa": 55, "spd": 110, "spe": 65},
+    },
+    "greninjamega": {
+        "types": ("water", "dark"),
+        "ability": "protean",
+        "base_stats": {"hp": 72, "atk": 125, "def": 87, "spa": 133, "spd": 81, "spe": 132},
+    },
+    "gyaradosmega": {
+        "types": ("water", "dark"),
+        "ability": "moldbreaker",
+        "base_stats": {"hp": 95, "atk": 155, "def": 109, "spa": 70, "spd": 130, "spe": 81},
+    },
+    "hawluchamega": {
+        "types": ("fighting", "flying"),
+        "ability": "noguard",
+        "base_stats": {"hp": 78, "atk": 137, "def": 100, "spa": 74, "spd": 93, "spe": 118},
+    },
+    "heracrossmega": {
+        "types": ("bug", "fighting"),
+        "ability": "skilllink",
+        "base_stats": {"hp": 80, "atk": 185, "def": 115, "spa": 40, "spd": 105, "spe": 75},
+    },
+    "houndoommega": {
+        "types": ("dark", "fire"),
+        "ability": "solarpower",
+        "base_stats": {"hp": 75, "atk": 90, "def": 90, "spa": 140, "spd": 90, "spe": 115},
+    },
+    "kangaskhanmega": {
+        "types": ("normal",),
+        "ability": "parentalbond",
+        "base_stats": {"hp": 105, "atk": 125, "def": 100, "spa": 60, "spd": 100, "spe": 100},
+    },
+    "lopunnymega": {
+        "types": ("normal", "fighting"),
+        "ability": "scrappy",
+        "base_stats": {"hp": 65, "atk": 136, "def": 94, "spa": 54, "spd": 96, "spe": 135},
+    },
+    "lucariomega": {
+        "types": ("fighting", "steel"),
+        "ability": "adaptability",
+        "base_stats": {"hp": 70, "atk": 145, "def": 88, "spa": 140, "spd": 70, "spe": 112},
+    },
+    "lucariomegaz": {
+        "types": ("fighting", "steel"),
+        "ability": "auraguard",
+        "base_stats": {"hp": 70, "atk": 100, "def": 70, "spa": 164, "spd": 70, "spe": 151},
+    },
+    "malamarmega": {
+        "types": ("dark", "psychic"),
+        "ability": "contrary",
+        "base_stats": {"hp": 86, "atk": 102, "def": 88, "spa": 98, "spd": 120, "spe": 88},
+    },
+    "manectricmega": {
+        "types": ("electric",),
+        "ability": "intimidate",
+        "base_stats": {"hp": 70, "atk": 75, "def": 80, "spa": 135, "spd": 80, "spe": 135},
+    },
+    "mawilemega": {
+        "types": ("steel", "fairy"),
+        "ability": "hugepower",
+        "base_stats": {"hp": 50, "atk": 105, "def": 125, "spa": 55, "spd": 95, "spe": 50},
+    },
+    "medichammega": {
+        "types": ("fighting", "psychic"),
+        "ability": "purepower",
+        "base_stats": {"hp": 60, "atk": 100, "def": 85, "spa": 80, "spd": 85, "spe": 100},
+    },
+    "meganiummega": {
+        "types": ("grass", "fairy"),
+        "ability": "megasol",
+        "base_stats": {"hp": 80, "atk": 92, "def": 115, "spa": 143, "spd": 115, "spe": 80},
+    },
+    "meowsticfmega": {
+        "types": ("psychic",),
+        "ability": "trace",
+        "base_stats": {"hp": 74, "atk": 48, "def": 76, "spa": 143, "spd": 101, "spe": 124},
+    },
+    "meowsticmmega": {
+        "types": ("psychic",),
+        "ability": "trace",
+        "base_stats": {"hp": 74, "atk": 48, "def": 76, "spa": 143, "spd": 101, "spe": 124},
+    },
+    "metagrossmega": {
+        "types": ("steel", "psychic"),
+        "ability": "toughclaws",
+        "base_stats": {"hp": 80, "atk": 145, "def": 150, "spa": 105, "spd": 110, "spe": 110},
+    },
+    "pidgeotmega": {
+        "types": ("normal", "flying"),
+        "ability": "noguard",
+        "base_stats": {"hp": 83, "atk": 80, "def": 80, "spa": 135, "spd": 80, "spe": 121},
+    },
+    "pinsirmega": {
+        "types": ("bug", "flying"),
+        "ability": "aerilate",
+        "base_stats": {"hp": 65, "atk": 155, "def": 120, "spa": 65, "spd": 90, "spe": 105},
+    },
+    "pyroarmega": {
+        "types": ("fire", "normal"),
+        "ability": "firemane",
+        "base_stats": {"hp": 86, "atk": 88, "def": 92, "spa": 129, "spd": 86, "spe": 126},
+    },
+    "raichumegax": {
+        "types": ("electric",),
+        "ability": "electricsurge",
+        "base_stats": {"hp": 60, "atk": 135, "def": 95, "spa": 90, "spd": 95, "spe": 110},
+    },
+    "raichumegay": {
+        "types": ("electric",),
+        "ability": "noguard",
+        "base_stats": {"hp": 60, "atk": 100, "def": 55, "spa": 160, "spd": 80, "spe": 130},
+    },
+    "sableyemega": {
+        "types": ("dark", "ghost"),
+        "ability": "magicbounce",
+        "base_stats": {"hp": 50, "atk": 85, "def": 125, "spa": 85, "spd": 115, "spe": 20},
+    },
+    "salamencemega": {
+        "types": ("dragon", "flying"),
+        "ability": "aerilate",
+        "base_stats": {"hp": 95, "atk": 145, "def": 130, "spa": 120, "spd": 90, "spe": 120},
+    },
+    "sceptilemega": {
+        "types": ("grass", "dragon"),
+        "ability": "lightningrod",
+        "base_stats": {"hp": 70, "atk": 110, "def": 75, "spa": 145, "spd": 85, "spe": 145},
+    },
+    "scizormega": {
+        "types": ("bug", "steel"),
+        "ability": "technician",
+        "base_stats": {"hp": 70, "atk": 150, "def": 140, "spa": 65, "spd": 100, "spe": 75},
+    },
+    "scolipedemega": {
+        "types": ("bug", "poison"),
+        "ability": "shellarmor",
+        "base_stats": {"hp": 60, "atk": 140, "def": 149, "spa": 75, "spd": 99, "spe": 62},
+    },
+    "scovillainmega": {
+        "types": ("grass", "fire"),
+        "ability": "spicyspray",
+        "base_stats": {"hp": 65, "atk": 138, "def": 85, "spa": 138, "spd": 85, "spe": 75},
+    },
+    "scraftymega": {
+        "types": ("dark", "fighting"),
+        "ability": "intimidate",
+        "base_stats": {"hp": 65, "atk": 130, "def": 135, "spa": 55, "spd": 135, "spe": 68},
+    },
+    "sharpedomega": {
+        "types": ("water", "dark"),
+        "ability": "strongjaw",
+        "base_stats": {"hp": 70, "atk": 140, "def": 70, "spa": 110, "spd": 65, "spe": 105},
+    },
+    "skarmorymega": {
+        "types": ("steel", "flying"),
+        "ability": "stalwart",
+        "base_stats": {"hp": 65, "atk": 140, "def": 110, "spa": 40, "spd": 100, "spe": 110},
+    },
+    "slowbromega": {
+        "types": ("water", "psychic"),
+        "ability": "shellarmor",
+        "base_stats": {"hp": 95, "atk": 75, "def": 180, "spa": 130, "spd": 80, "spe": 30},
+    },
+    "staraptormega": {
+        "types": ("fighting", "flying"),
+        "ability": "contrary",
+        "base_stats": {"hp": 85, "atk": 140, "def": 100, "spa": 60, "spd": 90, "spe": 110},
+    },
+    "starmiemega": {
+        "types": ("water", "psychic"),
+        "ability": "hugepower",
+        "base_stats": {"hp": 60, "atk": 100, "def": 105, "spa": 130, "spd": 105, "spe": 120},
+    },
+    "steelixmega": {
+        "types": ("steel", "ground"),
+        "ability": "sandforce",
+        "base_stats": {"hp": 75, "atk": 125, "def": 230, "spa": 55, "spd": 95, "spe": 30},
+    },
+    "swampertmega": {
+        "types": ("water", "ground"),
+        "ability": "swiftswim",
+        "base_stats": {"hp": 100, "atk": 150, "def": 110, "spa": 95, "spd": 110, "spe": 70},
+    },
+    "tyranitarmega": {
+        "types": ("rock", "dark"),
+        "ability": "sandstream",
+        "base_stats": {"hp": 100, "atk": 164, "def": 150, "spa": 95, "spd": 120, "spe": 71},
+    },
+    "venusaurmega": {
+        "types": ("grass", "poison"),
+        "ability": "thickfat",
+        "base_stats": {"hp": 80, "atk": 100, "def": 123, "spa": 122, "spd": 120, "spe": 80},
+    },
+    "victreebelmega": {
+        "types": ("grass", "poison"),
+        "ability": "innardsout",
+        "base_stats": {"hp": 80, "atk": 125, "def": 85, "spa": 135, "spd": 95, "spe": 70},
+    },
+}
+
+MEGA_STONE_PRIORS = {
+    "charizard": {
+        "charizarditey": 0.95,
+        "charizarditex": 0.05,
+    },
+    "raichu": {
+        "raichunitey": 0.83,
+        "raichunitex": 0.17,
+    },
+    "garchomp": {
+        "garchompitez": 0.94,
+        "garchompite": 0.06,
+    },
+    "lucario": {
+        "lucarionitez": 0.94,
+        "lucarionite": 0.06,
+    },
+    "absol": {
+        "absolitez": 0.99,
+        "absolite": 0.01
+    }
 }

@@ -1,18 +1,20 @@
-# RL Concepts
+# Concepts
 
-## Encoding The State
+## RL Concepts
+
+### Encoding The State
 
 We need to encode the state into a form that the neural network can understand. For this project, the observation space is all the information of the board state on a given turn. We represent each "aspect" (e.g. field effects like weather/terrain, the Pokemon themselves and their moves/stats, etc.). We flatten the tensor at the end so it can be fed into the network. Read `state_encoder.py` for more concrete examples.
 
-## Action Space
+### Action Space
 
 We also have to represent each action for the neural network. In this project, the action space is basically all the moves and switches that could possibly be made in a given turn, regardless of legality in the rules of Pokemon. The network assigns probabilities (logits) for each action. For that, we create a mask that tells the neural network to essentially assign 0 probability to any illegal actions.
 
-### The All-False Mask
+#### The All-False Mask
 
 We must be careful not to apply a mask with only `False` values. Because the mask changes all `False`-valued actions (illegal actions in this case) to have logits of $-\infty$, when we softmax the logits, we would get $\frac{e^{\tilde{z}_i}}{\sum e^{\tilde{z}_j}} = \mathrm{NaN}$ for each action $i$, where $\tilde{z}$ is the tensor of logits. PyTorch will crash when trying to sample from distributions containing `NaN`, and worse, during the backward pass (gradient update), the gradient for each weight will be calculated as $\nabla_{\theta}L = \mathrm{NaN}$, so when the weights are updated, each weight will become $\theta_{new} = \theta_{old} - \alpha \cdot \mathrm{NaN} = \mathrm{NaN}$, destroying the model. To fix this, we can just set one dummy action in the mask to `True` and ignore it since we know it's illegal.
 
-## "Translating" Between 2 "Worlds"
+### "Translating" Between 2 "Worlds"
 
 RL algorithms deal in pure floats and run in a clean loop (world 1). However, Pokemon Showdown (poke-env) runs asynchronously on the server (world 2). Additionally, Showdown does not return data as the pure floats that the RL algorithm needs! We need to create an environment that bridges the gap between these two. Gymnasium environments can do this. It runs Showdown in the background and translates Showdown's battle events into synchronous data for the RL algorithm to use.
 
@@ -20,19 +22,19 @@ When the RL algorithm steps and passes in 2 action indices, the environment tran
 
 Additionally, Gymnasium environments are ideal because they can be used with prewritten, high-performance RL libraries with 0 modification, they can run RL agents in parallel, and they can catch incorrect input/output sizes (for example, index of 26 when you need [0..25]) before they destroy the neural network's weights.
 
-## PPO
+### PPO
 
 PPO is an actor-critic reinforcement learning method. The actor $\pi_{\theta}(a | s)$ is the part that reads in the state and outputs probabilities assigned to each action (probability of actions given state, the policy), while the critic $V_{\phi}(s)$ (the value function) takes in the state and outputs an expected future reward of this *state* assuming the agent follows the current policy ("win equity"). Both of these components are learned simultaneously.
 
-### Probability Ratio
+#### Probability Ratio
 
 One problem of early policy gradient algorithms (PPO is a policy gradient algorithm, meaning it learns the best policy to maximize reward), a big issue was models taking too big of a gradient step, leading to model collapse, collecting only garbage data, as the data comes from its own actions. PPO limits the probability ratio (ratio between the new policy and an old policy) $$r_t(\theta) = \frac{\pi_{\theta}(a_t | s_t)}{\pi_{\theta_{old}}(a_t | s_t)}$$ to be within some range $[1 - \epsilon, 1 + \epsilon]$, where $\epsilon$ is provided as a hyperparameter, typically $0.2$. This prevents the model from changing the policy too quickly.
 
-### Advantage Function
+#### Advantage Function
 
 Another consideration of PPO is in how actions are rewarded. Specifically, actions shouldn't be rewarded simply because the outcome was good. In the Pokemon example, what if the agent blunders on turn 4 but wins the game on turn 8 because it was bailed out by a lucky crit, a flinch, etc.? This is where the advantage function $\hat{A}_t = Q(s_t, a_t) - V(s_t)$ comes into play. $Q(s_t, a_t)$ is the function that the expected reward of this *action*. The $Q$ function and the value function are related: $V^{\pi}(s) = \sum_{a \in A} \pi(a | s)Q^{\pi}(s, a)$. When the advantage function is greater than 0, the action was better than expected and should be made more likely, and vice versa for when it is less than 0. However, in the actor-critic method, $Q$ is unknown, and so the advantage function is calculated with an approximation using *generalized advantage estimation* (GAE). I won't dive into the mathematical details because it's probably not too useful for me currently; what's important is that there are two discount factors $\gamma$ and $\lambda$ (reward discount and bias-variance tradeoff) that are usually $0.99$ and $0.95$ respectively, and that GAE makes PPO resilient against noise (such as critical hits, flinches, accuracy, damage rolls, etc. in the case of Pokemon). The environmental reward (scalar value returned by the reward function) is also used when calculating GAE.
 
-### Loss Function
+#### Loss Function
 
 The PPO loss function actually has 3 parts, first of which is the following: $$\textit{L}^{CLIP}(\theta) = \hat{\mathbb{E}}_t[\min(r_t(\theta)\hat{A}_t, \text{clip}(r_t(\theta), 1 - \epsilon, 1 + \epsilon)\hat{A}_t)]$$ which can generally be understood based on the variables introduced earlier ($\hat{\mathbb{E}}_t$ means the empirical expectation over the timesteps). This $\min$ part is simply the mathematical way to express, "get the lower between the probability ratio and the clipped ratio", or "don't let the ratio become bigger than or smaller than some value". This works because the advantage function is positive for "good" actions and negative for "bad" ones, meaning the gradient will point uphill for "good" actions and vice versa. The clipping means that once the ratio reaches a certain number, the gradient will become 0 and thus prevents the model from continuously increasing the probability for that action. This is the part that refines the actor (the policy).
 
@@ -42,14 +44,14 @@ The final part is the part that incentivizes trying different actions, $$S[\pi_{
 
 The total loss looks like this: $$\text{Loss}_{\text{total}}(\theta, \phi) = -\textit{L}^{CLIP}(\theta) + c_1\textit{L}^{VF}(\phi) - c_2S[\pi_{\theta}](s_t)$$
 
-### Steps in Training
+#### Steps in Training
 
 1. Rollout (Data Collection): The current policy $\pi_{\theta_{\text{old}}}$ takes `n_steps` number of steps (e.g. 2048). At each turn $t$ the network outputs the action distribution $\pi_{\text{old}}(a | s_t)$ and the value estimate $V_{\text{old}}(s_t)$. The agent samples the action distribution and gets $a_t$ and saves everything into memory.
 2. GAE: Once all steps are calculated, PPO runs GAE backwards from step 2048 down to 1 and standardizes advantages calculated for all 2048 steps.
 3. Optimization: PPO then takes the 2048 steps and slices random batches of `batch_size`, then trains for `n_epochs` epochs. This is where new weights, probability ratio, and loss are calculated and optimized.
 4. Discard, Repeat: PPO discards the 2048 steps as they are now outdated (generated by an old policy). The new weights $\theta$ are now stored as the new $\theta_{\text{old}}$ and the loop repeats from phase 1.
 
-### Hyperparameters
+#### Hyperparameters
 
 | Hyperparameter | Typical Value | What It Controls | What Happens If Too High | What Happens If Too Low |
 | :--- | :--- | :--- | :--- | :--- |
@@ -64,7 +66,7 @@ The total loss looks like this: $$\text{Loss}_{\text{total}}(\theta, \phi) = -\t
 | `vf_coef` ($c_1$) | $0.5$ | Weight of Critic loss in the total loss | Critic overpowers Actor; policy ignores move selection | Critic learns poorly; advantage estimates become inaccurate |
 | `max_grad_norm` | $0.5$ | Gradient clipping threshold | Exploding gradients on rare/unusual turn states | Gradients are truncated too heavily |
 
-## Reward Function Principles
+### Reward Function Principles
 
 1. Winning must be strictly better than any loop, otherwise the agent will simply loop forever
 2. Don't reward states themselves, reward the change between states, otherwise the agent will loop forever
@@ -73,6 +75,28 @@ The total loss looks like this: $$\text{Loss}_{\text{total}}(\theta, \phi) = -\t
 5. Consider whether an agent cheese the system by stalling or dying early on purpose
 6. Start simple before adding too many hyperparameters, otherwise it will be very difficult to tell what hyperparameter is causing undesirable behavior
 
-## Model vs. Algorithm
+### Model vs. Algorithm
 
 PPO is the **algorithm** here. The **model** is the MLP layers, the weights, etc.
+
+## Lookahead
+
+In order to truly mimic human-level play in Pokemon, the agent has to be able to select the best move while considering what the opponent may do and how the board state may be affected later down the line. In order to implement this, we effectively have to "simulate" the battle forward a certain number of turns. However, because actions in Pokemon occur simultaneously for both players and information is imperfect, a simple minimax or alpha-beta pruning or the likes would be insufficient. With imperfect information, and the fact that there is a kind of rock-paper-scissors dynamic at play (for example, setting up while the opponent attacks or attacking while the opponent sets up, etc.), there may be multiple choices that could potentially be good that depend solely on the unknown action of the opponent.
+
+### Bimatrix Game
+
+Since each player has finite actions and receive some payoff, we can construct a bimatrix game (a game represented by two payoff matrices). We can construct a matrix $A$ and a matrix $B$, where $A, B \in \mathbb{R}^{N \times M}$, where $N$ and $M$ are the number of possible actions for each player respectively. In, for example, $A[i, j]$ is the payoff received by player 1 if player 1 does action $i$ and player 2 does action $j$. However, since Pokemon is a zero-sum game, we only need one payoff matrix $P$. On each turn (and simulated turn if the target depth has not been reached), this reward matrix must be calculated (i.e. simulate each action pair and evaluate them) for the agent to maximize payoff.
+
+### Solving the Game Matrix
+
+In Pokemon, we don't want a fixed strategy. Obviously, the agent should be able to click a different move every turn if necessary, and so a mixed strategy is what we need. So, we need to find the mixed strategy nash equilibrium, which is basically the probability distribution of actions that leads to the maximum expected payoff assuming no other players change their strategies. CFR (Counterfactual Regret) is how we do this. Basically, we loop through $T$ iterations (timesteps, unrelated to the number of timesteps we are simulating the game for).
+
+On the first iteration (timestep), the cumulative regrets and action probabilities (strategies) for both players are set to 0 for each action. We then calculate the new strategy for each player by assigning probability $\frac{\max{0, R^t(i)}}{\sum_k \max{0, R^t(k)}}$ (we only care about positive regret, i.e. the $i$ th move should have had higher weight) to each action $i$ at timestep $t$, except the case where $R^t(i) \leq 0 \, \forall \, i$, in which case the new strategy for the timestep is simply a uniform distribution over all actions, then simply add accordingly to each player's cumulative strategy.
+
+We then calculate the regrets for each action, which is the payoff for playing move $i$ minus the payoff expected by the current strategy (scale each individual action payoff by its probability). We do this for both players and simply add to the cumulative regrets for each player accordingly.
+
+At the end, after all iterations are complete, we get the normalized strategy for each player (which is just the cumulative divided by the number of iterations), which is proven to converge to the nash equilibrium. We can also calculate the expected game payoff using these equilibrium strategies.
+
+For the case of doubles in Pokemon, there are way too many branching paths to check them all. For example, if each slot has 4 possible moves and 2 possible switches, each side will have 36 possible actions (in the implementation, each battle state has 676 possible joint actions!) which would cause a huge explosion and be way too costly to compute nash equilibriums for. So, we need a kind of heuristic to select the top $n$ moves where $n$ is some fairly small number, in order to greatly prune the number of game matrices we actually need to solve.
+
+There also needs to be a custom training loop in order to use lookahead in conjunction with the RL model. The way this can be done is by storing all transition states (observation, policy, value) at the end of each episode. This is technically even better than raw unsupervised training since we have a definitive answer to the ending value of each episode.

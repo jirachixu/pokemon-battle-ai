@@ -1,6 +1,6 @@
 import poke_env.battle as pkmn_b
 from poke_env.player import Player, RandomPlayer
-from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder, ForfeitBattleOrder, BattleOrder
+from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder, ForfeitBattleOrder, BattleOrder, DefaultBattleOrder
 
 import gymnasium.spaces as spaces
 import gymnasium as gym
@@ -8,8 +8,11 @@ import numpy as np
 from typing import Any
 import queue
 import asyncio
+import uuid
+from poke_env.ps_client.account_configuration import AccountConfiguration
 
 from src.state_encoder import StateEncoder
+from src.simulation import clean_id
 from src import constants
 
 # ----------------- Action and Order Helper Functions -----------------
@@ -172,21 +175,34 @@ def action_to_double_order(player: Player, battle: pkmn_b.DoubleBattle, actions:
                     pkmn_b.Target.ADJACENT_ALLY_OR_SELF
                 ]:
                     target_pos = get_target_position(target_index, slot_index == 0)
+                    if move.target in [pkmn_b.Target.NORMAL, pkmn_b.Target.ANY, pkmn_b.Target.ADJACENT_FOE]:
+                        opp1 = battle.opponent_active_pokemon[0] if len(battle.opponent_active_pokemon) > 0 else None
+                        opp2 = battle.opponent_active_pokemon[1] if len(battle.opponent_active_pokemon) > 1 else None
+                        opp1_alive = opp1 is not None and not getattr(opp1, "fainted", False)
+                        opp2_alive = opp2 is not None and not getattr(opp2, "fainted", False)
+                        if target_pos == 1 and not opp1_alive and opp2_alive:
+                            target_pos = 2
+                        elif target_pos == 2 and not opp2_alive and opp1_alive:
+                            target_pos = 1
                 else:
                     target_pos = 0
                 orders.append(player.create_order(order=move, move_target=target_pos, mega=is_mega))
             elif battle.available_moves[slot_index]:
                 orders.append(player.create_order(order=battle.available_moves[slot_index][0]))
+            elif battle.available_switches[slot_index]:
+                orders.append(player.create_order(order=battle.available_switches[slot_index][0]))
             else:
-                orders.append(PassBattleOrder())
+                orders.append(DefaultBattleOrder())
         else:
             switch_index = action - 24
             if 0 <= switch_index < len(bench) and bench[switch_index] in battle.available_switches[slot_index]:
                 orders.append(player.create_order(order=bench[switch_index]))
             elif battle.available_switches[slot_index]:
                 orders.append(player.create_order(order=battle.available_switches[slot_index][0]))
+            elif battle.available_moves[slot_index]:
+                orders.append(player.create_order(order=battle.available_moves[slot_index][0]))
             else:
-                orders.append(PassBattleOrder())
+                orders.append(DefaultBattleOrder())
             
     return DoubleBattleOrder(*orders)
 
@@ -197,11 +213,14 @@ class RLPlayer(Player):
     Custom Player class for reinforcement learning.
     """
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("accept_open_team_sheet", True)
+        if "account_configuration" not in kwargs:
+            kwargs["account_configuration"] = AccountConfiguration(f"RLPlayer_{uuid.uuid4().hex[:6]}", None)
         super().__init__(*args, **kwargs)
-        self.battle_queue = queue.Queue(maxsize=1)
+        self.battle_queue = queue.Queue()
         self.current_order_future: asyncio.Future | None = None
         
-    async def choose_move(self, battle: pkmn_b.AbstractBattle) -> DoubleBattleOrder:
+    async def choose_move(self, battle: pkmn_b.AbstractBattle) -> BattleOrder:
         """
         Puts the current battle state into the queue and waits for the RL agent to provide an order. Because the battle is \
         put into the queue before the order is retrieved, this ensures that the RL agent always has the most up-to-date \
@@ -212,6 +231,9 @@ class RLPlayer(Player):
             DoubleBattleOrder: The Order object chosen by the RL agent.
         """
         assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
+        if self._trying_again.is_set():
+            self._trying_again.clear()
+            return self.choose_default_move()
         self.current_order_future = self.ps_client.loop.create_future()
         self.battle_queue.put(battle)
         return await self.current_order_future
@@ -386,7 +408,17 @@ class VGCEnv(gym.Env):
         )
         self.agent.receive_order(order)
         # Wait for the next state of the battle after the action is processed.
-        self.current_battle = self.agent.battle_queue.get()
+        try:
+            self.current_battle = self.agent.battle_queue.get(timeout=45.0)
+        except queue.Empty:
+            self.agent.receive_order(ForfeitBattleOrder())
+            try:
+                self.current_battle = self.agent.battle_queue.get(timeout=5.0)
+            except queue.Empty:
+                pass
+            state = self.state_encoder.encode(self.current_battle)
+            return state, -1.0, True, True, {}
+
         reward = self.calculate_reward(self.current_battle)
         done = self.current_battle.finished
         state = self.state_encoder.encode(self.current_battle)

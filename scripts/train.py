@@ -5,17 +5,29 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from stable_baselines3.common.monitor import Monitor
 from torch.cuda import is_available
-from poke_env.player import SimpleHeuristicsPlayer
+from src.search import LookaheadPlayer
 from src.models import VGCFeatureExtractor
 
 with open("teams/MC306.txt", "r") as f:
     team = f.read().strip()
 
-opponent = SimpleHeuristicsPlayer(battle_format="gen9championsvgc2026regmc", team=team)
+# Training opponent uses 2-turn forward lookahead with Nash equilibrium
+opponent = LookaheadPlayer(
+    battle_format="gen9championsvgc2026regmc",
+    team=team,
+    depth=2,
+    max_candidates=6,
+)
 env = VGCEnv(opponent=opponent)
 env.agent.update_team(team=team)
 
-eval_opponent = SimpleHeuristicsPlayer(battle_format="gen9championsvgc2026regmc", team=team)
+# Evaluation opponent uses 2-turn forward lookahead
+eval_opponent = LookaheadPlayer(
+    battle_format="gen9championsvgc2026regmc",
+    team=team,
+    depth=2,
+    max_candidates=6,
+)
 eval_env_raw = VGCEnv(opponent=eval_opponent)
 eval_env_raw.agent.update_team(team=team)
 eval_env = Monitor(eval_env_raw)
