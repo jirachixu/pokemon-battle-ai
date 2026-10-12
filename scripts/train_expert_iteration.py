@@ -25,7 +25,7 @@ from poke_env.player import SimpleHeuristicsPlayer
 from src.env import VGCEnv
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch, LookaheadPlayer
-from src.models import VGCFeatureExtractor
+from src.models import VGCFeatureExtractor, TeamPreviewModel
 
 # Transition structure for Expert Iteration replay buffer
 Transition = collections.namedtuple(
@@ -46,6 +46,7 @@ class ExpertIterationTrainer:
         self,
         model: MaskablePPO,
         training_environment: VGCEnv,
+        preview_model: TeamPreviewModel,
         search_depth: int = 2,
         search_candidates_limit: int = 10,
         replay_buffer_capacity: int = 15000,
@@ -74,6 +75,7 @@ class ExpertIterationTrainer:
         self.entropy_weight = entropy_weight
         self.checkpoint_directory = checkpoint_directory
         self.best_model_directory = best_model_directory
+        self.preview_model = preview_model
         self.device = device
 
         os.makedirs(self.checkpoint_directory, exist_ok=True)
@@ -81,20 +83,29 @@ class ExpertIterationTrainer:
 
         if torch is not None and optim is not None:
             self.optimizer = optim.Adam(self.model.policy.parameters(), lr=learning_rate)
+            self.preview_optimizer = optim.Adam(self.preview_model.parameters(), lr=1e-4)
         else:
             self.optimizer = None
-
+            self.preview_optimizer = None
+        
     def collect_lookahead_episode(self) -> tuple[float, int]:
         """
         Plays a full battle where every decision is computed by the 2-turn lookahead search.
         Records the (observation, action_mask, search_policy_target) transitions.
         Returns (episode_reward, episode_turn_count).
         """
+        if torch is None or self.preview_optimizer is None:
+            raise RuntimeError("PyTorch is required to train the team preview model.")
+        
         observation, _ = self.training_environment.reset()
         episode_transitions: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]] = []
         is_terminated = False
         is_truncated = False
         cumulative_reward = 0.0
+        # Record the team preview decision for policy/value training
+        preview_data = self.training_environment.agent.last_preview_decision
+        preview_log_probability = preview_data["log_probability"]
+        preview_value = preview_data["value"]
 
         while not (is_terminated or is_truncated):
             current_battle = self.training_environment.current_battle
@@ -169,6 +180,17 @@ class ExpertIterationTrainer:
 
         # Determine final battle outcome value for value head target: +1.0 for win, -1.0 for loss
         final_game_outcome = 1.0 if cumulative_reward > 0.0 else (-1.0 if cumulative_reward < 0.0 else 0.0)
+        # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
+        # it will backprop through the policy loss part as well
+        advantage = final_game_outcome - preview_value.item()
+        policy_loss = -preview_log_probability * advantage
+        value_loss = 0.5 * ((preview_value - final_game_outcome) ** 2)
+        entropy_loss = -0.01 * preview_data["entropy"]
+        preview_loss = policy_loss + value_loss + entropy_loss
+        
+        self.preview_optimizer.zero_grad()
+        preview_loss.backward()
+        self.preview_optimizer.step()
 
         # Store transitions with final game outcome into the replay buffer
         for transition_observation, transition_mask, transition_target_policy in episode_transitions:
@@ -389,6 +411,14 @@ class ExpertIterationTrainer:
                 self.model.save(best_model_path)
                 print(f"Updated best model at {best_model_path}")
 
+                preview_checkpoint_path = os.path.join(
+                    self.checkpoint_directory, f"team_preview_model_{episode_index}_episodes.pt"
+                )
+                torch.save(self.preview_model.state_dict(), preview_checkpoint_path)
+                
+                best_preview_path = os.path.join(self.best_model_directory, "best_team_preview_model.pt")
+                torch.save(self.preview_model.state_dict(), best_preview_path)
+                
                 # Periodic Benchmark Evaluation against SimpleHeuristics baseline
                 if self.eval_environment is not None:
                     eval_win_rate, eval_reward, eval_turns = self.evaluate_benchmark(n_episodes=5)
@@ -422,6 +452,7 @@ def main():
     eval_environment.agent.update_team(team=team_paste)
 
     best_checkpoint_path = "./checkpoints/best_model/best_model.zip"
+    best_preview_checkpoint_path = "./checkpoints/best_model/best_team_preview_model.pt"
 
     device_name = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
     start_episode = 1
@@ -443,7 +474,7 @@ def main():
         print("Initializing fresh MaskablePPO model...")
         policy_arguments = dict(
             features_extractor_class=VGCFeatureExtractor,
-            features_extractor_kwargs=dict(ability_dim=32),
+            features_extractor_kwargs=dict(ability_dim=32, item_dim=32),
             net_arch=dict(pi=[512, 256], vf=[512, 256]),
         )
         ppo_model = MaskablePPO(
@@ -454,10 +485,19 @@ def main():
             tensorboard_log="./logs/",
             verbose=1,
         )
+        
+    if os.path.exists(best_preview_checkpoint_path):
+        print(f"Loading existing team preview model from {best_preview_checkpoint_path}...")
+        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
+        preview_model.load_state_dict(torch.load(best_preview_checkpoint_path, map_location=device_name))
+    else:
+        print("Initializing fresh TeamPreviewModel...")
+        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
 
     trainer = ExpertIterationTrainer(
         model=ppo_model,
         training_environment=raw_environment,
+        preview_model=preview_model,
         eval_environment=eval_environment,
         search_depth=2,
         search_candidates_limit=10,
@@ -471,6 +511,11 @@ def main():
         best_model_directory="./checkpoints/best_model/",
         device=device_name,
     )
+
+    # Ensure that the agent shares the same team preview model as the trainer so it can be updated during training
+    # and used during evaluation
+    raw_environment.agent.team_preview_model = trainer.preview_model
+    eval_environment.agent.team_preview_model = trainer.preview_model
 
     trainer.learn(
         total_episodes=1000,

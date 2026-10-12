@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 
-df = pd.read_csv("./championsmcpastes.csv")
+df = pd.read_csv("./championsmcpastes.csv", skiprows=2)
 
 for index, row in df.iterrows():
     if ("top" in row["Team Description"].lower() \

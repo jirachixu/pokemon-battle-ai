@@ -2,6 +2,7 @@ import poke_env.battle as pkmn_b
 import torch
 from src import constants
 import numpy as np
+from typing import Optional
 from src.item_priors import ITEM_PRIORS
 from src.damage_calc import evaluate_move_power_and_multipliers, get_move_type_and_bp_boost
 
@@ -416,3 +417,33 @@ class StateEncoder:
             "items": self.encode_items(battle).numpy()
         }
     
+class TeamPreviewEncoder:
+    def __init__(self, state_encoder: Optional[StateEncoder] = None):
+        self.state_encoder = state_encoder if state_encoder is not None else StateEncoder()
+
+    def encode(self, battle: pkmn_b.DoubleBattle) -> dict[str, torch.Tensor]:
+        """
+        Generates the encoding tensors for the team preview state of the battle.
+        Args:
+            battle (pkmn_b.DoubleBattle): The battle object containing the current state.
+        Returns:
+            dict[str, torch.Tensor]: The complete encoded arrays for the team preview state.
+        """
+        p1_mons = (list(battle.team.values()) + [None] * 6)[:6]
+        p2_mons = (list(battle.opponent_team.values()) + [None] * 6)[:6]
+        all_mons = p1_mons + p2_mons
+        
+        numeric_list = []
+        abilities_list = []
+        items_list = []
+        
+        for mon in all_mons:
+            numeric_list.append(self.state_encoder.encode_single_pokemon(mon, battle)) # (142,)
+            abilities_list.append(self.state_encoder.encode_single_ability(mon))        # (215,)
+            items_list.append(self.state_encoder.encode_single_item(mon))               # (167,)
+
+        return {
+            "numeric": torch.cat(numeric_list),       # Shape: (12 * 142,) = (1704,)
+            "abilities": torch.stack(abilities_list), # Shape: (12, 215)
+            "items": torch.stack(items_list),         # Shape: (12, 167)
+        }

@@ -19,9 +19,11 @@ from poke_env.player import SimpleHeuristicsPlayer, RandomPlayer, Player
 from src.env import VGCEnv
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch, LookaheadPlayer
+from src.models import TeamPreviewModel
 
 def evaluate_neural_lookahead(
     model_path: str = "./checkpoints/best_model/best_model.zip",
+    preview_model_path: str = "./checkpoints/best_model/best_team_preview_model.pt",
     team_path: str = "teams/MC306.txt",
     n_eval_episodes: int = 50,
     search_depth: int = 2,
@@ -38,6 +40,11 @@ def evaluate_neural_lookahead(
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading trained neural model from: {model_path} on {device_name}...")
     model = MaskablePPO.load(model_path, device=device_name)
+
+    print(f"Loading trained team preview model from: {preview_model_path} on {device_name}...")
+    preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
+    preview_model.load_state_dict(torch.load(preview_model_path, map_location=device_name))
+    preview_model.eval()
 
     opponent: Player
     if opponent_type == "lookahead":
@@ -66,6 +73,7 @@ def evaluate_neural_lookahead(
 
     raw_env = VGCEnv(opponent=opponent)
     raw_env.agent.update_team(team=team_paste)
+    raw_env.agent.team_preview_model = preview_model
 
     searcher = LookaheadSearch(
         depth=search_depth,
@@ -153,6 +161,12 @@ def evaluate_neural_lookahead(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Neural-Guided Lookahead AI on Pokemon VGC")
     parser.add_argument("--model", type=str, default="./checkpoints/best_model/best_model.zip", help="Path to trained model")
+    parser.add_argument(
+        "--preview_model",
+        type=str,
+        default="./checkpoints/best_model/best_team_preview_model.pt",
+        help="Path to trained team preview model checkpoint"
+    )
     parser.add_argument("--episodes", type=int, default=50, help="Number of evaluation episodes")
     parser.add_argument("--depth", type=int, default=2, help="Lookahead search depth")
     parser.add_argument("--candidates", type=int, default=6, help="Candidate pool limit per slot")
@@ -167,6 +181,7 @@ def main():
 
     evaluate_neural_lookahead(
         model_path=args.model,
+        preview_model_path=args.preview_model,
         n_eval_episodes=args.episodes,
         search_depth=args.depth,
         search_candidates=args.candidates,
