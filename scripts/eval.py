@@ -52,7 +52,7 @@ def evaluate_neural_lookahead(
             battle_format="gen9championsvgc2026regmc",
             team=team_paste,
             depth=2,
-            max_candidates=4,
+            max_candidates=6,
             accept_open_team_sheet=True,
             account_configuration=AccountConfiguration(f"Lookahead_{uuid.uuid4().hex[:6]}", None),
         )

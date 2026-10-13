@@ -203,7 +203,7 @@ class SimulatedPokemon:
         "protect_counter", "is_protected", "first_turn", "is_mega", "can_mega_evolve",
         "fainted", "side", "slot", "flinch", "weight", "helping_hand",
         "taunt_turns", "encore_turns", "encore_move", "disabled_move",
-        "disable_turns", "torment", "destiny_bond", "cursed", "last_move_used"
+        "disable_turns", "torment", "destiny_bond", "cursed", "last_move_used", "just_flinched",
     )
 
     def __init__(
@@ -228,6 +228,7 @@ class SimulatedPokemon:
         side: int = 1,
         slot: int = 0,
         weight: float = 50.0,
+        just_flinched: bool = False,
     ):
         self.species = clean_id(species)
         self.name = name or self.species
@@ -268,6 +269,7 @@ class SimulatedPokemon:
         self.destiny_bond: bool = False
         self.cursed: bool = False
         self.last_move_used: Optional[str] = None
+        self.just_flinched: bool = just_flinched
 
     def _calculate_stats_from_base(
         self,
@@ -434,6 +436,7 @@ class SimulatedPokemon:
         cloned_pokemon.destiny_bond = self.destiny_bond
         cloned_pokemon.cursed = self.cursed
         cloned_pokemon.last_move_used = self.last_move_used
+        cloned_pokemon.just_flinched = self.just_flinched
         return cloned_pokemon
 
     def take_damage(self, damage_amount: float) -> float:
@@ -850,6 +853,7 @@ def step_simulation(
         if active_pkmn:
             active_pkmn.is_protected = False
             active_pkmn.helping_hand = False
+            active_pkmn.just_flinched = False
 
     player1_actions = [action_player1] if isinstance(action_player1, SimulatedAction) else list(action_player1)
     player2_actions = [action_player2] if isinstance(action_player2, SimulatedAction) else list(action_player2)
@@ -922,6 +926,7 @@ def step_simulation(
 
         if user_pokemon.flinch:
             user_pokemon.flinch = False
+            user_pokemon.just_flinched = True
             continue
 
         current_move = user_pokemon.moves.get(action.move_id)
@@ -1279,7 +1284,8 @@ def _execute_single_move(
         # Field and Side Conditions
         elif move.id == "tailwind":
             side_conditions = state.side1_conditions if attacker.side == 1 else state.side2_conditions
-            side_conditions["tailwind"] = 4
+            if side_conditions.get("tailwind", 0) == 0:
+                side_conditions["tailwind"] = 4
         elif move.id == "trickroom":
             if "trickroom" in state.fields:
                 del state.fields["trickroom"]

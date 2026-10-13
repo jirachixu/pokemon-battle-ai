@@ -1,5 +1,5 @@
 """
-Grandmaster-tier competitive battle state evaluator with optional Neural Network Value head integration.
+Competitive battle state evaluator with optional Neural Network Value head integration.
 Evaluates board states from Player 1's perspective.
 """
 
@@ -21,7 +21,7 @@ class BattleStateEvaluator(ABC):
 
 class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
     """
-    Handcrafted grandmaster-tier evaluation function for Doubles / VGC Pokemon battles.
+    Competitive evaluation function for Doubles / VGC Pokemon battles.
     Considers material balance, HP differentials, speed control, stat stages, status conditions,
     field control, and immediate offensive KO pressure.
     """
@@ -32,9 +32,10 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         weight_alive_differential: float = 2500.0,
         weight_hp_differential: float = 1500.0,
         weight_speed_control: float = 350.0,
-        weight_stat_boosts: float = 180.0,
+        weight_stat_boosts: float = 250.0,
         weight_status_penalty: float = 350.0,
-        weight_threat_pressure: float = 400.0,
+        weight_threat_pressure: float = 500.0,
+        weight_flinch: float = 1000.0,
     ):
         self.weight_win_loss = weight_win_loss
         self.weight_alive_differential = weight_alive_differential
@@ -43,7 +44,7 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         self.weight_stat_boosts = weight_stat_boosts
         self.weight_status_penalty = weight_status_penalty
         self.weight_threat_pressure = weight_threat_pressure
-
+        self.weight_flinch = weight_flinch
     def evaluate(self, state: SimulatedBattleState) -> float:
         """Computes evaluation score for state. Higher is better for Side 1."""
         winner_side = state.winner()
@@ -124,6 +125,13 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         for pokemon in state.all_side2_pokemon():
             if not pokemon.fainted:
                 evaluation_score += self._evaluate_status_penalty(pokemon)
+        # 5.1. Flinch Penalty
+        for pokemon in state.all_side1_pokemon():
+            if not pokemon.fainted:
+                evaluation_score -= self._evaluate_flinch_penalty(pokemon)
+        for pokemon in state.all_side2_pokemon():
+            if not pokemon.fainted:
+                evaluation_score += self._evaluate_flinch_penalty(pokemon)
 
         # 6. Immediate Lethal KO Threat Evaluation
         evaluation_score += self._evaluate_threat_matrix(side1_living_active, side2_living_active, state)
@@ -137,17 +145,24 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         speed_boost = pokemon.boosts.get("spe", 0)
         defense_boost = pokemon.boosts.get("def", 0)
         special_defense_boost = pokemon.boosts.get("spd", 0)
+        
+        is_special_attacker = self._is_special_attacker(pokemon)
+        is_physical_attacker = self._is_physical_attacker(pokemon)
 
         # Positive offensive stages
-        boost_score += max(0, attack_boost) * self.weight_stat_boosts
-        boost_score += max(0, special_attack_boost) * self.weight_stat_boosts
+        if is_special_attacker:
+            boost_score += max(0, special_attack_boost) * self.weight_stat_boosts
+        if is_physical_attacker:
+            boost_score += max(0, attack_boost) * self.weight_stat_boosts
         boost_score += max(0, speed_boost) * (self.weight_stat_boosts * 0.8)
         boost_score += max(0, defense_boost) * (self.weight_stat_boosts * 0.5)
         boost_score += max(0, special_defense_boost) * (self.weight_stat_boosts * 0.5)
 
         # Negative stages penalty
-        boost_score += min(0, attack_boost) * (self.weight_stat_boosts * 0.8)
-        boost_score += min(0, special_attack_boost) * (self.weight_stat_boosts * 0.8)
+        if is_special_attacker:
+            boost_score += min(0, special_attack_boost) * (self.weight_stat_boosts * 0.8)
+        if is_physical_attacker:
+            boost_score += min(0, attack_boost) * (self.weight_stat_boosts * 0.8)
         boost_score += min(0, speed_boost) * (self.weight_stat_boosts * 0.8)
         boost_score += min(0, defense_boost) * (self.weight_stat_boosts * 0.5)
         boost_score += min(0, special_defense_boost) * (self.weight_stat_boosts * 0.5)
@@ -215,7 +230,28 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
             if estimated_damage >= target.current_hp:
                 return True
         return False
+    
+    def _is_special_attacker(self, pokemon: SimulatedPokemon) -> bool:
+        """Heuristic to determine if a Pokemon is a special attacker. Specifically, if the Pokemon
+        has any special moves."""
+        special_moves = sum(1 for move in pokemon.moves.values() if move.category == "special" and move.base_power > 0)
+        if special_moves == 0:
+            return False
+        return True
+    
+    def _is_physical_attacker(self, pokemon: SimulatedPokemon) -> bool:
+        """Heuristic to determine if a Pokemon is primarily a physical attacker."""
+        physical_moves = sum(1 for move in pokemon.moves.values() if move.category == "physical" and move.base_power > 0)
+        if physical_moves == 0:
+            return False
+        return True
 
+    def _evaluate_flinch_penalty(self, pokemon: SimulatedPokemon) -> float:
+        """Evaluates the penalty for a Pokemon that is flinched and cannot act this turn."""
+        if pokemon.just_flinched:
+            return self.weight_flinch
+        return 0.0
+    
 class NeuralValueEvaluator(BattleStateEvaluator):
     """
     Evaluator that queries the trained neural network value head (critic) from Stable-Baselines3

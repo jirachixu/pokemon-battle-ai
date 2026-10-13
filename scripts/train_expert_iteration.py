@@ -457,19 +457,16 @@ def main():
     device_name = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
     start_episode = 1
 
+    checkpoint_dir = "./checkpoints/expert_iteration/"
+    if os.path.exists(checkpoint_dir):
+        for filename in os.listdir(checkpoint_dir):
+            file_path = os.path.join(checkpoint_dir, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+
     if os.path.exists(best_checkpoint_path):
         print(f"Loading existing model from {best_checkpoint_path}...")
         ppo_model = MaskablePPO.load(best_checkpoint_path, env=monitored_environment, device=device_name)
-        checkpoint_dir = "./checkpoints/expert_iteration/"
-        if os.path.exists(checkpoint_dir):
-            ep_nums = [
-                int(match.group(1))
-                for file_name in os.listdir(checkpoint_dir)
-                if (match := re.search(r"expert_iteration_model_(\d+)_episodes\.zip", file_name))
-            ]
-            if ep_nums:
-                start_episode = max(ep_nums) + 1
-                print(f"Found existing checkpoints. Resuming training from Episode {start_episode}...")
     else:
         print("Initializing fresh MaskablePPO model...")
         policy_arguments = dict(

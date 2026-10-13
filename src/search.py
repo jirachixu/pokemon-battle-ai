@@ -527,10 +527,17 @@ class LookaheadSearch:
                                         (80.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                     )
                 # High-Impact Speed & Field Control
-                elif mid in ("tailwind", "trickroom"):
+                elif mid == "trickroom":
                     slot_candidates.append(
                         (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
+                elif mid == "tailwind":
+                    state_conditions = state.side1_conditions if (active_pokemon and active_pokemon.side == 1) \
+                        else state.side2_conditions
+                    if state_conditions.get("tailwind", 0) == 0:
+                        slot_candidates.append(
+                            (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
+                        )
                 # Sleep Infliction
                 elif mid in ("spore", "sleeppowder", "hypnosis", "yawn"):
                     for target_index in (0, 1):
