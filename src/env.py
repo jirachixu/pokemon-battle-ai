@@ -5,18 +5,13 @@ from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder, For
 import gymnasium.spaces as spaces
 import gymnasium as gym
 import numpy as np
-from typing import Any
+from typing import Any, Optional
 import queue
 import asyncio
-import uuid
-from poke_env.ps_client.account_configuration import AccountConfiguration
-import torch
-from itertools import combinations
 
-from src.state_encoder import StateEncoder, TeamPreviewEncoder
-from src.simulation import clean_id
-from src import constants
-from src.models import TeamPreviewModel
+from src.state_encoder import StateEncoder
+from src.players import RLPlayer
+from src.team_pool import TeamPool
 
 # ----------------- Action and Order Helper Functions -----------------
 
@@ -211,106 +206,6 @@ def action_to_double_order(player: Player, battle: pkmn_b.DoubleBattle, actions:
 
 # ----------------- Custom Gymnasium Environment -----------------
 
-class RLPlayer(Player):
-    """
-    Custom Player class for reinforcement learning.
-    """
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("accept_open_team_sheet", True)
-        if "account_configuration" not in kwargs:
-            kwargs["account_configuration"] = AccountConfiguration(f"RLPlayer_{uuid.uuid4().hex[:6]}", None)
-        super().__init__(*args, **kwargs)
-        self.battle_queue = queue.Queue()
-        self.current_order_future: asyncio.Future | None = None
-        self.team_preview_encoder: TeamPreviewEncoder = TeamPreviewEncoder()
-        self.team_preview_model: TeamPreviewModel = TeamPreviewModel()
-        self.last_preview_decision = {}
-        
-    async def choose_move(self, battle: pkmn_b.AbstractBattle) -> BattleOrder:
-        """
-        Puts the current battle state into the queue and waits for the RL agent to provide an order. Because the battle is \
-        put into the queue before the order is retrieved, this ensures that the RL agent always has the most up-to-date \
-        battle state when making a decision.
-        Args:
-            battle (pkmn_b.AbstractBattle): The current battle state.
-        Returns:
-            DoubleBattleOrder: The Order object chosen by the RL agent.
-        """
-        assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
-        if self._trying_again.is_set():
-            self._trying_again.clear()
-            return self.choose_default_move()
-        self.current_order_future = self.ps_client.loop.create_future()
-        self.battle_queue.put(battle)
-        return await self.current_order_future
-    
-    def receive_order(self, order: BattleOrder) -> None:
-        """
-        Receives the order from the RL agent and sets the result of the current_order_future. This unblocks the \
-        choose_move coroutine, allowing it to return the order to Showdown.
-        Args:
-            order (BattleOrder): The Order object chosen by the RL agent.
-        """
-        if self.current_order_future and not self.current_order_future.done():
-            self.ps_client.loop.call_soon_threadsafe(self.current_order_future.set_result, order)
-    
-    def _battle_finished_callback(self, battle: pkmn_b.AbstractBattle) -> None:
-        """
-        Callback function called when a battle is finished. Puts the finished battle into the queue. This ensures that \
-        the thread isn't blocked waiting for the RL agent to provide an order after the battle has ended.
-        Args:
-            battle (pkmn_b.AbstractBattle): The finished battle.
-        """
-        assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
-        super()._battle_finished_callback(battle)
-        self.battle_queue.put(battle)
-    
-    def teampreview(self, battle: pkmn_b.AbstractBattle) -> str:
-        """
-        Uses the TeamPreviewEncoder and the TeamPreviewModel to decide which Pokémon to send out in the first \
-        turn of a double battle.
-        Args:
-            battle (pkmn_b.AbstractBattle): The battle currently in team preview.
-        """
-        assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
-        observation = self.team_preview_encoder.encode(battle)
-        device = next(self.team_preview_model.parameters()).device
-        observation = {key: value.to(device) for key, value in observation.items()}
-        
-        # Generate all possible combinations of 4 Pokémon from the 6 brought to battle, 
-        # and then all combinations of 2 leads from those 4. The remaining 2 are the backline Pokemon. 
-        team_preview_order = []
-        for brought_mons in combinations(range(6), 4):
-            for leads in combinations(brought_mons, 2):
-                back = [mon for mon in brought_mons if mon not in leads]
-                team_preview_order.append((leads[0], leads[1], back[0], back[1]))
-        
-        with torch.set_grad_enabled(self.team_preview_model.training):
-            logits, value = self.team_preview_model(observation)
-            distribution = torch.distributions.Categorical(logits=logits)
-            if not self.team_preview_model.training:
-                action_index = torch.argmax(logits)
-            else:
-                action_index = distribution.sample()
-            # Policy gradient loss uses log probabilities
-            log_probability = distribution.log_prob(action_index)
-            
-            # Used in training to calculate loss and update weights
-            self.last_preview_decision = {
-                "log_probability": log_probability,
-                "value": value,
-                "entropy": distribution.entropy(),
-            }
-        
-        lead_0, lead_1, back_0, back_1 = team_preview_order[int(action_index.item())]
-        # poke-env expects _selected_in_teampreview to be set for selected Pokemon
-        team_mons = list(battle.team.values())
-        for idx in (lead_0, lead_1, back_0, back_1):
-            if idx < len(team_mons):
-                team_mons[idx]._selected_in_teampreview = True
-        
-        return f"/team {lead_0 + 1}{lead_1 + 1}{back_0 + 1}{back_1 + 1}"
-
 class VGCEnv(gym.Env):
     """
     Custom Gymnasium environment for Pokémon VGC battles.
@@ -319,7 +214,9 @@ class VGCEnv(gym.Env):
         self, 
         agent: RLPlayer | None = None, 
         opponent: Player | None = None, 
-        battle_format: str = "gen9championsvgc2026regmc"
+        battle_format: str = "gen9championsvgc2026regmc",
+        team_pool: Optional[TeamPool] = None,
+        sample_teams: bool = True,
     ):
         super().__init__()
         self.battle_format = battle_format
@@ -332,6 +229,9 @@ class VGCEnv(gym.Env):
             "items": spaces.Box(low=0.0, high=1.0, shape=(8, 167), dtype=np.float32),
         })
         self.action_space = spaces.Discrete(676, dtype=np.int64)
+        self.team_pool = team_pool if team_pool is not None else TeamPool()
+        self.sample_teams = sample_teams
+        self.agent_team, self.opponent_team = None, None
         
     def action_masks(self) -> np.ndarray:
         """
@@ -387,6 +287,12 @@ class VGCEnv(gym.Env):
             and self.agent.current_order_future is not None
             and not self.agent.current_order_future.done()
         )
+                
+        if self.sample_teams:
+            self.agent_team, self.opponent_team = self.team_pool.sample_pair(stratified=True)
+            self.agent.update_team(self.agent_team.paste)
+            self.opponent.update_team(self.opponent_team.paste)
+            can_reuse_battle = False
         
         if not can_reuse_battle:
             # If a battle is unfinished mid-game, forfeit AND wait for Showdown to confirm it's closed

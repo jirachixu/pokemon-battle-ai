@@ -109,7 +109,8 @@ class StateEncoder:
             
             effective_type, _ = get_move_type_and_bp_boost(move, pokemon)
             move_type = torch.zeros(18, dtype=torch.float32)
-            move_type[constants.TYPE_TO_IDX[effective_type]] = 1.0
+            if effective_type in constants.TYPE_TO_IDX:
+                move_type[constants.TYPE_TO_IDX[effective_type]] = 1.0
 
             nominal_bp, effective_damage_1, effective_damage_2 = evaluate_move_power_and_multipliers(
                 move, pokemon, target_1, target_2, battle
@@ -146,7 +147,8 @@ class StateEncoder:
         type_tensor = torch.zeros(18, dtype=torch.float32)
         
         for pkmn_type in pokemon.types:
-            type_tensor[constants.TYPE_TO_IDX[pkmn_type]] = 1.0 
+            if pkmn_type in constants.TYPE_TO_IDX:
+                type_tensor[constants.TYPE_TO_IDX[pkmn_type]] = 1.0 
         
         # [poison, toxic, burn, freeze, paralysis, sleep, none]
         status_tensor = torch.zeros(7, dtype=torch.float32)

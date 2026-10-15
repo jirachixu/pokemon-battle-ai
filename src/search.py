@@ -2,8 +2,6 @@
 Multi-turn lookahead search engine for competitive Doubles Pokemon battles (VGC / Champions).
 Simulates 2-3 turns ahead using Simultaneous Matrix Game Solving (Nash Equilibrium via Regret Matching).
 """
-
-from __future__ import annotations
 import numpy as np
 from typing import Optional, Any, Sequence
 
@@ -18,9 +16,7 @@ from src.simulation import (
 import src.constants as constants
 from src.evaluator import BattleStateEvaluator, CompetitiveHeuristicEvaluator
 from poke_env.player import Player
-from poke_env.player.battle_order import BattleOrder, DoubleBattleOrder, PassBattleOrder
-from poke_env.ps_client.account_configuration import AccountConfiguration
-import uuid
+from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder
 from src.constants import (
     PROTECT_MOVES,
     STATUS_SUPPORT_MOVE_IDS,
@@ -236,6 +232,7 @@ class LookaheadSearch:
         slot1_candidates = self._get_slot_candidates(state, active_pokemon_list, bench_pokemon_list, opponent_pokemon_list, slot=1)
 
         joint_candidates: list[tuple[float, tuple[SimulatedAction, SimulatedAction]]] = []
+        code_to_pair: dict[int, tuple[SimulatedAction, SimulatedAction]] = {}
 
         for slot0_score, action_slot0 in slot0_candidates:
             for slot1_score, action_slot1 in slot1_candidates:
@@ -291,6 +288,7 @@ class LookaheadSearch:
                     action_code = int(min(675, max(0, slot0_code * 26 + slot1_code)))
                     if 0 <= action_code < len(policy_prior):
                         joint_score += 25.0 * float(policy_prior[action_code])
+                    code_to_pair[action_code] = (action_slot0, action_slot1)
 
                 joint_candidates.append((joint_score, (action_slot0, action_slot1)))
 
@@ -345,6 +343,15 @@ class LookaheadSearch:
             if pair not in selected_set and len(selected_candidates) < candidate_limit:
                 selected_candidates.append(pair)
                 selected_set.add(pair)
+
+        # Neural Dual-Nomination: Guarantee the neural network's top-2 joint actions enter the search tree
+        if policy_prior is not None and side == 1 and code_to_pair:
+            top_neural_indices = np.argsort(policy_prior)[::-1]
+            for action_code in top_neural_indices:
+                if action_code in code_to_pair:
+                    add_candidate(code_to_pair[action_code])
+                    if len(selected_candidates) >= 2 or len(selected_candidates) >= candidate_limit:
+                        break
 
         # Tactical quotas ensuring comprehensive matrix coverage across all strategic dimensions
         quota_focus0 = max(1, candidate_limit // 5)
@@ -421,6 +428,9 @@ class LookaheadSearch:
 
         slot_candidates: list[tuple[float, SimulatedAction]] = []
 
+        side_mega_used = state.side1_mega_used if (active_pokemon and active_pokemon.side == 1) else state.side2_mega_used
+        can_mega_now = bool(active_pokemon and active_pokemon.can_mega_evolve and not side_mega_used)
+
         is_doubles = (state.battle_format == "doubles")
         partner = active_pokemon_list[1 - slot] if (is_doubles and len(active_pokemon_list) > 1) else None
 
@@ -435,6 +445,14 @@ class LookaheadSearch:
                 continue  # Locked into encored move
             if active_pokemon.torment and active_pokemon.last_move_used and move_id == active_pokemon.last_move_used:
                 continue  # Cannot select same move consecutively under Torment
+            if active_pokemon.item == "assaultvest" and simulated_move.category == "status":
+                continue  # Cannot select status moves with Assault Vest
+            if active_pokemon.item in ("choiceband", "choicespecs", "choicescarf"):
+                if active_pokemon.last_move_used and active_pokemon.last_move_used in active_pokemon.moves and move_id != active_pokemon.last_move_used:
+                    continue  # Locked into previous move by Choice item
+            # Imprison: cannot select moves known by an active opposing Imprison user
+            if any(opp and not opp.fainted and opp.imprison and move_id in opp.moves for opp in opponent_pokemon_list):
+                continue
 
             # 1. Attacking moves (physical / special)
             if simulated_move.category != "status":
@@ -463,7 +481,7 @@ class LookaheadSearch:
                         slot_candidates.append(
                             (priority_score, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=0, mega=False))
                         )
-                        if active_pokemon.can_mega_evolve:
+                        if can_mega_now:
                             slot_candidates.append(
                                 (priority_score + 10.0, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=0, mega=True))
                             )
@@ -486,7 +504,7 @@ class LookaheadSearch:
                                 slot_candidates.append(
                                     (priority_score, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=target_index, mega=False))
                                 )
-                                if active_pokemon.can_mega_evolve:
+                                if can_mega_now:
                                     slot_candidates.append(
                                         (priority_score + 10.0, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=target_index, mega=True))
                                     )
@@ -568,6 +586,13 @@ class LookaheadSearch:
                                 slot_candidates.append(
                                     (80.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
+                elif mid == "imprison":
+                    if not active_pokemon.imprison:
+                        shared_count = sum(1 for opp in opponent_pokemon_list if opp and not opp.fainted for m in active_pokemon.moves if m in opp.moves)
+                        imp_score = 70.0 + min(25.0, shared_count * 10.0)
+                        slot_candidates.append(
+                            (imp_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
+                        )
                 elif mid in ("disable", "torment"):
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
@@ -670,20 +695,36 @@ class LookaheadSearch:
                                     (55.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
 
-        # 3. Switches to bench
-        for bench_index, bench_pokemon in enumerate(bench_pokemon_list):
-            if bench_pokemon and not bench_pokemon.fainted:
-                switch_score = 65.0
-                if bench_pokemon.ability == "intimidate":
-                    switch_score += 15.0
-                for opponent_pokemon in opponent_pokemon_list:
-                    if opponent_pokemon and not opponent_pokemon.fainted:
-                        for opponent_type in opponent_pokemon.types:
-                            if bench_pokemon.damage_multiplier(opponent_type) < 1.0:
-                                switch_score += 5.0
+        # If all moves were made invalid (disabled, choice locked into disabled move, taunted, imprisoned, etc.), generate Struggle
+        move_candidates = [c for c in slot_candidates if c[1].type == "move"]
+        if not move_candidates:
+            for target_index in (0, 1):
+                if target_index < len(opponent_pokemon_list):
+                    opp = opponent_pokemon_list[target_index]
+                    if opp and not opp.fainted:
+                        slot_candidates.append(
+                            (40.0, SimulatedAction("move", slot=slot, move_id="struggle", target_idx=target_index, mega=False))
+                        )
+            if not any(c[1].type == "move" for c in slot_candidates):
                 slot_candidates.append(
-                    (switch_score, SimulatedAction("switch", slot=slot, switch_idx=bench_index))
+                    (40.0, SimulatedAction("move", slot=slot, move_id="struggle", target_idx=0, mega=False))
                 )
+
+        # 3. Switches to bench
+        if not state.is_pokemon_trapped(active_pokemon):
+            for bench_index, bench_pokemon in enumerate(bench_pokemon_list):
+                if bench_pokemon and not bench_pokemon.fainted:
+                    switch_score = 65.0
+                    if bench_pokemon.ability == "intimidate":
+                        switch_score += 15.0
+                    for opponent_pokemon in opponent_pokemon_list:
+                        if opponent_pokemon and not opponent_pokemon.fainted:
+                            for opponent_type in opponent_pokemon.types:
+                                if bench_pokemon.damage_multiplier(opponent_type) < 1.0:
+                                    switch_score += 5.0
+                    slot_candidates.append(
+                        (switch_score, SimulatedAction("switch", slot=slot, switch_idx=bench_index))
+                    )
 
         if not slot_candidates:
             return [(50.0, SimulatedAction("move", slot=slot, move_id="struggle", target_idx=0))]
@@ -1057,39 +1098,3 @@ class LookaheadSearch:
         if slot_action.mega:
             slot_action_code += 12
         return min(25, max(0, slot_action_code))
-
-class LookaheadPlayer(Player):
-    """
-    Autonomous poke-env battle agent for Doubles / VGC powered by 2-3 turn simultaneous
-    lookahead search with Counterfactual Regret Matching (CFR) Nash equilibrium.
-    """
-
-    searcher: LookaheadSearch
-
-    def __init__(
-        self,
-        depth: int = 2,
-        max_candidates: int = 10,
-        evaluator: Optional[BattleStateEvaluator] = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        kwargs.setdefault("accept_open_team_sheet", True)
-        if "account_configuration" not in kwargs:
-            kwargs["account_configuration"] = AccountConfiguration(f"Lookahead_{uuid.uuid4().hex[:6]}", None)
-        kwargs.pop("method", None)
-        super().__init__(*args, **kwargs)
-        self.searcher = LookaheadSearch(
-            evaluator=evaluator or CompetitiveHeuristicEvaluator(),
-            depth=depth,
-            max_candidates=max_candidates,
-        )
-
-    def choose_move(self, battle: Any) -> BattleOrder:
-        if self._trying_again.is_set():
-            self._trying_again.clear()
-            return self.choose_default_move()
-        try:
-            return self.searcher.select_order(battle, player=self)
-        except Exception:
-            return self.choose_default_move()

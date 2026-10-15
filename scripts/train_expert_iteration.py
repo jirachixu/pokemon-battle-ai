@@ -24,7 +24,8 @@ from poke_env.player import SimpleHeuristicsPlayer
 
 from src.env import VGCEnv
 from src.simulation import SimulatedBattleState
-from src.search import LookaheadSearch, LookaheadPlayer
+from src.search import LookaheadSearch
+from src.players import LookaheadPlayer
 from src.models import VGCFeatureExtractor, TeamPreviewModel
 
 # Transition structure for Expert Iteration replay buffer
@@ -172,10 +173,15 @@ class ExpertIterationTrainer:
             observation, reward, is_terminated, is_truncated, _ = self.training_environment.step(chosen_action_code)
             cumulative_reward += reward
             turn_count = len(episode_transitions)
+            
+            agent_team, opponent_team = self.training_environment.agent_team, self.training_environment.opponent_team
+            team_info = f"Agent Team: {agent_team.team_id}, {agent_team.archetypes} | Opponent Team: {opponent_team.team_id}, {opponent_team.archetypes}" \
+                if agent_team and opponent_team else "Teams not sampled"
             print(
                 f"    [Turn {current_battle.turn:2d} (Step {turn_count:2d})] "
                 f"Action: {chosen_action_code:3d} (NN Top: {top_nn_action:3d} p={top_nn_prob:.2f} V={state_value_pred:+.2f}) | "
-                f"Step Reward: {reward:+.3f} | Total: {cumulative_reward:+.3f}"
+                f"Step Reward: {reward:+.3f} | Total: {cumulative_reward:+.3f} | "
+                f"{team_info}"
             )
 
         # Determine final battle outcome value for value head target: +1.0 for win, -1.0 for loss
@@ -428,28 +434,9 @@ class ExpertIterationTrainer:
                     )
 
 def main():
-    team_file_path = os.path.join(os.path.dirname(__file__), "..", "teams", "MC306.txt")
+    team_file_path = os.path.join(os.path.dirname(__file__), "..", "teams", "MC646.txt")
     with open(team_file_path, "r", encoding="utf-8") as file_handle:
         team_paste = file_handle.read().strip()
-
-    training_opponent = LookaheadPlayer(
-        battle_format="gen9championsvgc2026regmc",
-        team=team_paste,
-        depth=2,
-        max_candidates=6,
-    )
-    raw_environment = VGCEnv(opponent=training_opponent)
-    raw_environment.agent.update_team(team=team_paste)
-    monitored_environment = Monitor(raw_environment)
-
-    eval_opponent = SimpleHeuristicsPlayer(
-        battle_format="gen9championsvgc2026regmc",
-        team=team_paste,
-        accept_open_team_sheet=True,
-        account_configuration=AccountConfiguration(f"Heuristic_{uuid.uuid4().hex[:6]}", None),
-    )
-    eval_environment = VGCEnv(opponent=eval_opponent)
-    eval_environment.agent.update_team(team=team_paste)
 
     best_checkpoint_path = "./checkpoints/best_model/best_model.zip"
     best_preview_checkpoint_path = "./checkpoints/best_model/best_team_preview_model.pt"
@@ -463,6 +450,34 @@ def main():
             file_path = os.path.join(checkpoint_dir, filename)
             if os.path.isfile(file_path):
                 os.remove(file_path)
+        
+    if os.path.exists(best_preview_checkpoint_path):
+        print(f"Loading existing team preview model from {best_preview_checkpoint_path}...")
+        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
+        preview_model.load_state_dict(torch.load(best_preview_checkpoint_path, map_location=device_name))
+    else:
+        print("Initializing fresh TeamPreviewModel...")
+        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
+
+    training_opponent = LookaheadPlayer(
+        battle_format="gen9championsvgc2026regmc",
+        team=team_paste,
+        depth=2,
+        max_candidates=8,
+        team_preview_model=preview_model,
+    )
+    raw_environment = VGCEnv(opponent=training_opponent)
+    raw_environment.agent.update_team(team=team_paste)
+    monitored_environment = Monitor(raw_environment)
+
+    eval_opponent = SimpleHeuristicsPlayer(
+        battle_format="gen9championsvgc2026regmc",
+        team=team_paste,
+        accept_open_team_sheet=True,
+        account_configuration=AccountConfiguration(f"Heuristic_{uuid.uuid4().hex[:6]}", None),
+    )
+    eval_environment = VGCEnv(opponent=eval_opponent)
+    eval_environment.agent.update_team(team=team_paste)
 
     if os.path.exists(best_checkpoint_path):
         print(f"Loading existing model from {best_checkpoint_path}...")
@@ -482,14 +497,6 @@ def main():
             tensorboard_log="./logs/",
             verbose=1,
         )
-        
-    if os.path.exists(best_preview_checkpoint_path):
-        print(f"Loading existing team preview model from {best_preview_checkpoint_path}...")
-        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
-        preview_model.load_state_dict(torch.load(best_preview_checkpoint_path, map_location=device_name))
-    else:
-        print("Initializing fresh TeamPreviewModel...")
-        preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
 
     trainer = ExpertIterationTrainer(
         model=ppo_model,
@@ -497,8 +504,8 @@ def main():
         preview_model=preview_model,
         eval_environment=eval_environment,
         search_depth=2,
-        search_candidates_limit=10,
-        replay_buffer_capacity=15000,
+        search_candidates_limit=8,
+        replay_buffer_capacity=100000,
         learning_rate=1e-4,
         batch_size=64,
         policy_loss_weight=1.0,
@@ -515,7 +522,7 @@ def main():
     eval_environment.agent.team_preview_model = trainer.preview_model
 
     trainer.learn(
-        total_episodes=1000,
+        total_episodes=3000,
         training_steps_per_episode=8,
         checkpoint_frequency=25,
         start_episode=start_episode,

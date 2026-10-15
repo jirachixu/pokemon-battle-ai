@@ -5,7 +5,7 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from stable_baselines3.common.monitor import Monitor
 from torch.cuda import is_available
-from src.search import LookaheadPlayer
+from src.players import LookaheadPlayer
 from src.models import VGCFeatureExtractor
 
 with open("teams/MC306.txt", "r") as f:

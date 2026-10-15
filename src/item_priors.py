@@ -2,11 +2,12 @@
 # Do not edit manually.
 
 ITEM_PRIORS = {
-    "absol": {
-        "absolitez": 1.0,
-    },
     "aerodactyl": {
-        "focussash": 1.0,
+        "focussash": 0.5,
+        "aerodactylite": 0.5,
+    },
+    "alcremie": {
+        "rockyhelmet": 1.0,
     },
     "altaria": {
         "habanberry": 1.0,
@@ -21,31 +22,30 @@ ITEM_PRIORS = {
         "leftovers": 1.0,
     },
     "armarouge": {
-        "lifeorb": 0.5,
-        "leftovers": 0.25,
-        "twistedspoon": 0.25,
+        "lifeorb": 0.6667,
+        "twistedspoon": 0.3333,
     },
     "basculegion": {
-        "lifeorb": 0.4,
-        "choicescarf": 0.4,
+        "choicescarf": 0.4667,
+        "lifeorb": 0.2,
         "mysticwater": 0.2,
+        "focussash": 0.1333,
     },
-    "blastoise": {
-        "blastoisinite": 1.0,
+    "basculegionf": {
+        "focussash": 1.0,
+    },
+    "baxcalibur": {
+        "baxcalibrite": 1.0,
     },
     "camerupt": {
         "cameruptite": 1.0,
     },
     "ceruledge": {
-        "colburberry": 0.3333,
+        "grassyseed": 0.6667,
         "focussash": 0.3333,
-        "grassyseed": 0.3333,
     },
     "charizard": {
         "charizarditey": 1.0,
-    },
-    "corviknight": {
-        "psychicseed": 1.0,
     },
     "delphox": {
         "delphoxite": 1.0,
@@ -54,18 +54,20 @@ ITEM_PRIORS = {
         "lifeorb": 1.0,
     },
     "dragonite": {
-        "dragoninite": 0.6,
-        "lifeorb": 0.4,
+        "dragoninite": 0.8571,
+        "lifeorb": 0.1429,
     },
     "excadrill": {
-        "focussash": 1.0,
+        "focussash": 0.5,
+        "choicescarf": 0.5,
     },
     "farigiraf": {
-        "sitrusberry": 0.375,
-        "colburberry": 0.25,
-        "grassyseed": 0.125,
-        "twistedspoon": 0.125,
-        "lifeorb": 0.125,
+        "sitrusberry": 0.6471,
+        "colburberry": 0.1176,
+        "twistedspoon": 0.0588,
+        "lifeorb": 0.0588,
+        "wiseglasses": 0.0588,
+        "silkscarf": 0.0588,
     },
     "floetteeternal": {
         "floettite": 1.0,
@@ -78,8 +80,11 @@ ITEM_PRIORS = {
     },
     "garchomp": {
         "garchompitez": 0.5,
-        "choicescarf": 0.3333,
+        "choicescarf": 0.2083,
         "lifeorb": 0.1667,
+        "garchompite": 0.0417,
+        "dragonfang": 0.0417,
+        "habanberry": 0.0417,
     },
     "gardevoir": {
         "gardevoirite": 1.0,
@@ -88,16 +93,15 @@ ITEM_PRIORS = {
         "gengarite": 1.0,
     },
     "gholdengo": {
-        "lifeorb": 0.9459,
-        "whiteherb": 0.027,
-        "leftovers": 0.027,
-    },
-    "glimmora": {
-        "glimmoranite": 0.6667,
-        "focussash": 0.3333,
+        "lifeorb": 0.9375,
+        "whiteherb": 0.0312,
+        "leftovers": 0.0312,
     },
     "golisopod": {
         "golisopite": 1.0,
+    },
+    "grapploct": {
+        "lifeorb": 1.0,
     },
     "grimmsnarl": {
         "lightclay": 1.0,
@@ -105,36 +109,34 @@ ITEM_PRIORS = {
     "hatterene": {
         "lifeorb": 1.0,
     },
-    "hippowdon": {
-        "leftovers": 1.0,
-    },
     "hydreigon": {
         "focussash": 1.0,
     },
     "incineroar": {
         "sitrusberry": 0.7714,
-        "passhoberry": 0.0857,
-        "rockyhelmet": 0.0857,
-        "chopleberry": 0.0571,
+        "passhoberry": 0.1143,
+        "chopleberry": 0.1143,
     },
     "indeedee": {
-        "focussash": 0.5,
-        "choicescarf": 0.5,
+        "focussash": 1.0,
     },
     "indeedeef": {
-        "rockyhelmet": 0.5833,
-        "colburberry": 0.3333,
-        "focussash": 0.0833,
+        "rockyhelmet": 0.8182,
+        "colburberry": 0.1818,
+    },
+    "kangaskhan": {
+        "kangaskhanite": 1.0,
     },
     "kingambit": {
-        "chopleberry": 0.5625,
-        "lifeorb": 0.1875,
-        "focussash": 0.125,
-        "blackglasses": 0.125,
+        "chopleberry": 0.3077,
+        "lifeorb": 0.3077,
+        "focussash": 0.2692,
+        "blackglasses": 0.0769,
+        "occaberry": 0.0385,
     },
     "kommoo": {
-        "leftovers": 0.75,
-        "lifeorb": 0.25,
+        "leftovers": 0.8571,
+        "lifeorb": 0.1429,
     },
     "lopunny": {
         "lopunnite": 1.0,
@@ -142,22 +144,26 @@ ITEM_PRIORS = {
     "lucario": {
         "lucarionitez": 1.0,
     },
-    "mausholdfour": {
-        "widelens": 1.0,
-    },
     "mawile": {
         "mawilite": 1.0,
+    },
+    "meganium": {
+        "meganiumite": 1.0,
+    },
+    "meowsticf": {
+        "meowsticite": 1.0,
     },
     "metagross": {
         "metagrossite": 1.0,
     },
     "milotic": {
-        "sitrusberry": 0.5,
+        "sitrusberry": 0.3333,
         "leftovers": 0.3333,
-        "psychicseed": 0.1667,
+        "psychicseed": 0.2222,
+        "grassyseed": 0.1111,
     },
-    "ninetalesalola": {
-        "choicescarf": 1.0,
+    "ninetales": {
+        "focussash": 1.0,
     },
     "noivern": {
         "focussash": 1.0,
@@ -166,64 +172,68 @@ ITEM_PRIORS = {
         "focussash": 1.0,
     },
     "pelipper": {
-        "focussash": 0.5455,
-        "sitrusberry": 0.3636,
-        "lifeorb": 0.0909,
+        "sitrusberry": 0.4,
+        "focussash": 0.35,
+        "damprock": 0.2,
+        "lifeorb": 0.05,
     },
     "politoed": {
-        "sitrusberry": 0.5,
-        "mysticwater": 0.25,
-        "ejectbutton": 0.25,
+        "mysticwater": 0.5,
+        "sitrusberry": 0.375,
+        "ejectbutton": 0.125,
     },
     "primarina": {
-        "grassyseed": 0.5,
-        "leftovers": 0.25,
-        "lifeorb": 0.25,
+        "leftovers": 0.8,
+        "lifeorb": 0.2,
     },
     "pyroar": {
         "pyroarite": 1.0,
     },
     "raichu": {
-        "raichunitey": 1.0,
+        "raichunitey": 0.9231,
+        "raichunitex": 0.0769,
     },
     "rillaboom": {
-        "miracleseed": 0.7455,
-        "sitrusberry": 0.0909,
-        "ejectbutton": 0.0727,
-        "expertbelt": 0.0364,
-        "occaberry": 0.0364,
-        "lifeorb": 0.0182,
+        "miracleseed": 0.8409,
+        "expertbelt": 0.0455,
+        "ejectbutton": 0.0455,
+        "sitrusberry": 0.0227,
+        "occaberry": 0.0227,
+        "lifeorb": 0.0227,
+    },
+    "rotomheat": {
+        "choicescarf": 1.0,
     },
     "salamence": {
         "salamencite": 1.0,
     },
-    "scrafty": {
-        "focussash": 1.0,
+    "sceptile": {
+        "sceptilite": 1.0,
     },
     "sinistcha": {
-        "sitrusberry": 0.6667,
-        "rockyhelmet": 0.3333,
+        "colburberry": 0.4,
+        "rockyhelmet": 0.2,
+        "sitrusberry": 0.2,
+        "occaberry": 0.2,
     },
     "sinistchamasterpiece": {
         "colburberry": 1.0,
     },
-    "sirfetchâd": {
+    "sirfetchd": {
         "expertbelt": 1.0,
     },
     "sneasler": {
-        "grassyseed": 0.4848,
-        "whiteherb": 0.303,
-        "psychicseed": 0.1515,
-        "focussash": 0.0606,
-    },
-    "snorlax": {
-        "leftovers": 1.0,
-    },
-    "squawkabilly": {
-        "choicescarf": 1.0,
+        "whiteherb": 0.3659,
+        "grassyseed": 0.2195,
+        "psychicseed": 0.2195,
+        "focussash": 0.1707,
+        "electricseed": 0.0244,
     },
     "staraptor": {
         "staraptite": 1.0,
+    },
+    "starmie": {
+        "starminite": 1.0,
     },
     "swampert": {
         "swampertite": 1.0,
@@ -235,23 +245,30 @@ ITEM_PRIORS = {
         "sharpbeak": 1.0,
     },
     "torkoal": {
-        "charcoal": 0.6667,
-        "lifeorb": 0.3333,
+        "charcoal": 0.75,
+        "lifeorb": 0.25,
     },
     "toxapex": {
         "leftovers": 1.0,
     },
     "tyranitar": {
-        "tyranitarite": 0.8571,
-        "chopleberry": 0.1429,
+        "tyranitarite": 1.0,
     },
     "venusaur": {
-        "focussash": 0.6667,
-        "widelens": 0.3333,
+        "focussash": 0.75,
+        "widelens": 0.125,
+        "lifeorb": 0.125,
+    },
+    "vivillon": {
+        "focussash": 1.0,
     },
     "volcarona": {
-        "grassyseed": 0.5,
-        "rockyhelmet": 0.5,
+        "rockyhelmet": 0.6,
+        "sitrusberry": 0.2,
+        "leftovers": 0.2,
+    },
+    "watchog": {
+        "chopleberry": 1.0,
     },
     "whimsicott": {
         "focussash": 1.0,

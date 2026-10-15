@@ -2,9 +2,8 @@
 High-performance forward simulation engine for competitive Pokemon Doubles (VGC / Champions).
 Supports simultaneous-turn resolution, damage calculation, and multi-turn lookahead.
 """
-
-from __future__ import annotations
 import math
+import unicodedata
 import os
 import re
 import json
@@ -21,6 +20,13 @@ MAXIMUM_INDIVIDUAL_VALUE: int = 31
 _MOVES_CACHE: dict[str, dict] = {}
 _POKEDEX_CACHE: dict[str, dict] = {}
 _TYPECHART_CACHE: dict[str, dict] = {}
+
+_SOUND_MOVES: set[str] = {
+    "hypervoice", "snarl", "boomburst", "roar", "sing", "perishsong",
+    "bugbuzz", "clangoroussoul", "clangingscales", "sparklingaria",
+    "uproar", "screech", "metalsound", "partingshot", "disarmingvoice",
+    "echoedvoice", "round", "relicsong", "alluringvoice", "howl", "torchsong"
+}
 
 def _load_static_data() -> None:
     global _MOVES_CACHE, _POKEDEX_CACHE, _TYPECHART_CACHE
@@ -61,12 +67,17 @@ def _load_static_data() -> None:
 _load_static_data()
 
 def clean_id(value: Any) -> str:
-    """Normalizes identifiers to lowercase alphanumeric."""
+    """Normalizes identifiers to lowercase alphanumeric, stripping accents and mojibake."""
     if not value:
         return ""
     if hasattr(value, "name"):
         value = value.name
-    return re.sub(r"[^a-zA-Z0-9]", "", str(value)).lower()
+    s = str(value)
+    # Strip common UTF-8 mojibake artifacts
+    s = s.replace("â€™", "").replace("â", "").replace("’", "").replace("'", "")
+    # Decompose unicode accents (e.g. Flabébé -> Flabebe)
+    s = unicodedata.normalize("NFKD", s)
+    return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
 
 def get_type_effectiveness(attacking_type: str, defending_types: tuple[str, ...], has_gravity: bool = False) -> float:
     """Calculates type effectiveness multiplier against defending types."""
@@ -197,13 +208,15 @@ class SimulatedMove:
 
 class SimulatedPokemon:
     __slots__ = (
-        "species", "name", "types", "level", "current_hp", "max_hp",
+        "species", "name", "types", "base_types", "roost_active", "protean_activated",
+        "level", "current_hp", "max_hp",
         "current_hp_fraction", "base_stats", "stats", "boosts",
         "status", "toxic_turns", "item", "ability", "moves",
         "protect_counter", "is_protected", "first_turn", "is_mega", "can_mega_evolve",
         "fainted", "side", "slot", "flinch", "weight", "helping_hand",
         "taunt_turns", "encore_turns", "encore_move", "disabled_move",
         "disable_turns", "torment", "destiny_bond", "cursed", "last_move_used", "just_flinched",
+        "perish_turns", "is_trapped", "imprison"
     )
 
     def __init__(
@@ -229,10 +242,16 @@ class SimulatedPokemon:
         slot: int = 0,
         weight: float = 50.0,
         just_flinched: bool = False,
+        perish_turns: int = 0,
+        is_trapped: bool = False,
+        imprison: bool = False,
     ):
         self.species = clean_id(species)
         self.name = name or self.species
         self.types = tuple(clean_id(type_name) for type_name in types)
+        self.base_types = self.types
+        self.roost_active: bool = False
+        self.protean_activated: bool = False
         self.level = level
         self.max_hp = max(1.0, float(max_hp))
         self.current_hp = max(0.0, min(self.max_hp, float(hp)))
@@ -270,6 +289,9 @@ class SimulatedPokemon:
         self.cursed: bool = False
         self.last_move_used: Optional[str] = None
         self.just_flinched: bool = just_flinched
+        self.perish_turns: int = perish_turns
+        self.is_trapped: bool = is_trapped
+        self.imprison: bool = imprison
 
     def _calculate_stats_from_base(
         self,
@@ -378,6 +400,8 @@ class SimulatedPokemon:
                 if len(moves_dictionary) >= 4:
                     break
 
+        mega_stones = constants.BASE_TO_MEGA_STONE.get(cleaned_species, [])
+        can_mega = (not is_mega and bool(mega_stones) and (item in mega_stones or cleaned_species == "rayquaza"))
         simulated_pokemon = cls(
             species=cleaned_species,
             types=types,
@@ -386,7 +410,7 @@ class SimulatedPokemon:
             ability=ability,
             moves=moves_dictionary,
             is_mega=is_mega,
-            can_mega_evolve=(not is_mega and cleaned_species in constants.BASE_TO_MEGA_STONE),
+            can_mega_evolve=can_mega,
             side=side,
             slot=slot,
             weight=weight,
@@ -404,6 +428,9 @@ class SimulatedPokemon:
         cloned_pokemon.species = self.species
         cloned_pokemon.name = self.name
         cloned_pokemon.types = self.types
+        cloned_pokemon.base_types = self.base_types
+        cloned_pokemon.roost_active = self.roost_active
+        cloned_pokemon.protean_activated = self.protean_activated
         cloned_pokemon.level = self.level
         cloned_pokemon.current_hp = self.current_hp
         cloned_pokemon.max_hp = self.max_hp
@@ -437,6 +464,9 @@ class SimulatedPokemon:
         cloned_pokemon.cursed = self.cursed
         cloned_pokemon.last_move_used = self.last_move_used
         cloned_pokemon.just_flinched = self.just_flinched
+        cloned_pokemon.perish_turns = self.perish_turns
+        cloned_pokemon.is_trapped = self.is_trapped
+        cloned_pokemon.imprison = self.imprison
         return cloned_pokemon
 
     def take_damage(self, damage_amount: float) -> float:
@@ -586,11 +616,15 @@ class SimulatedBattleState:
     quick_guard: dict[int, bool]
     crafty_shield: dict[int, bool]
 
+    side1_mega_used: bool
+    side2_mega_used: bool
+
     __slots__ = (
         "battle_format", "side1_active", "side2_active", "side1_bench", "side2_bench",
         "weather", "fields", "side1_conditions", "side2_conditions", "turn",
         "hit_counts", "force_switch", "trapped", "_raw_battle_reference",
-        "redirect_target", "wide_guard", "quick_guard", "crafty_shield"
+        "redirect_target", "wide_guard", "quick_guard", "crafty_shield",
+        "side1_mega_used", "side2_mega_used"
     )
 
     def __init__(
@@ -626,6 +660,8 @@ class SimulatedBattleState:
         self.wide_guard = {1: False, 2: False}
         self.quick_guard = {1: False, 2: False}
         self.crafty_shield = {1: False, 2: False}
+        self.side1_mega_used = False
+        self.side2_mega_used = False
 
     def clone(self) -> "SimulatedBattleState":
         """Fast deep clone for game tree rollouts."""
@@ -648,6 +684,8 @@ class SimulatedBattleState:
         cloned_state.wide_guard = self.wide_guard.copy()
         cloned_state.quick_guard = self.quick_guard.copy()
         cloned_state.crafty_shield = self.crafty_shield.copy()
+        cloned_state.side1_mega_used = self.side1_mega_used
+        cloned_state.side2_mega_used = self.side2_mega_used
         return cloned_state
 
     def all_side1_pokemon(self) -> list[SimulatedPokemon]:
@@ -675,6 +713,32 @@ class SimulatedBattleState:
         if side2_alive_count == 0:
             return 1  # Side 1 won
         return None  # Battle ongoing
+
+    def is_pokemon_trapped(self, pokemon: Optional[SimulatedPokemon]) -> bool:
+        """Determines if a Pokemon is trapped and prohibited from switching."""
+        if not pokemon or pokemon.fainted:
+            return False
+        if "ghost" in pokemon.types:
+            return False
+        if pokemon.item == "shedshell":
+            return False
+        if pokemon.is_trapped:
+            return True
+
+        opponents = self.side2_active if pokemon.side == 1 else self.side1_active
+        for opp in opponents:
+            if opp and not opp.fainted:
+                if opp.ability == "shadowtag" and pokemon.ability != "shadowtag":
+                    return True
+                if opp.ability == "arenatrap":
+                    is_grounded = ("gravity" in self.fields) or (
+                        "flying" not in pokemon.types and pokemon.ability != "levitate" and pokemon.item != "airballoon"
+                    )
+                    if is_grounded:
+                        return True
+                if opp.ability == "magnetpull" and "steel" in pokemon.types:
+                    return True
+        return False
 
     @classmethod
     def from_battle(cls, battle: Any, fill_unrevealed: bool = True) -> "SimulatedBattleState":
@@ -744,6 +808,17 @@ class SimulatedBattleState:
         if hasattr(battle, "force_switch") and isinstance(battle.force_switch, list):
             state.force_switch = [bool(flag) for flag in battle.force_switch[:2]]
 
+        # Trapped flags from live battle
+        if hasattr(battle, "trapped") and isinstance(battle.trapped, list):
+            state.trapped = [bool(flag) for flag in battle.trapped[:2]]
+            for slot_idx, is_tr in enumerate(state.trapped):
+                if is_tr and slot_idx < len(state.side1_active):
+                    active_pokemon = state.side1_active[slot_idx]
+                    if active_pokemon is not None:
+                        active_pokemon.is_trapped = True
+
+        state.side1_mega_used = any(p and p.is_mega for p in state.side1_active + state.side1_bench)
+        state.side2_mega_used = any(p and p.is_mega for p in state.side2_active + state.side2_bench)
         state._raw_battle_reference = battle
         return state
 
@@ -779,6 +854,45 @@ class SimulatedBattleState:
         simulated_pokemon.protect_counter = getattr(mon, "protect_counter", 0)
         simulated_pokemon.is_protected = False
         simulated_pokemon.first_turn = getattr(mon, "first_turn", False)
+
+        # Sync dynamic typing from battle observation (handles Double Shock, Soak, etc.)
+        if hasattr(mon, "types") and mon.types:
+            simulated_pokemon.types = tuple(
+                clean_id(t.name) for t in mon.types
+                if hasattr(t, "name") and t.name != "THREE_QUESTION_MARKS"
+            )
+
+        # Sync volatile effects from live battle (Taunt, Encore, Disable, Torment, Perish Song, Trapping)
+        effects_dict = getattr(mon, "effects", {})
+        if not isinstance(effects_dict, dict):
+            effects_dict = getattr(mon, "_effects", {})
+        if isinstance(effects_dict, dict):
+            for eff, count in effects_dict.items():
+                eff_name = getattr(eff, "name", str(eff)).upper()
+                if "TAUNT" in eff_name:
+                    simulated_pokemon.taunt_turns = max(1, 3 - count) if isinstance(count, int) else 3
+                elif "ENCORE" in eff_name:
+                    simulated_pokemon.encore_turns = max(1, 3 - count) if isinstance(count, int) else 3
+                    if getattr(mon, "last_move", None):
+                        simulated_pokemon.encore_move = clean_id(mon.last_move.id)
+                elif "DISABLE" in eff_name:
+                    simulated_pokemon.disable_turns = max(1, 4 - count) if isinstance(count, int) else 4
+                    if getattr(mon, "last_move", None):
+                        simulated_pokemon.disabled_move = clean_id(mon.last_move.id)
+                elif "TORMENT" in eff_name:
+                    simulated_pokemon.torment = True
+                elif "PERISH" in eff_name:
+                    if "PERISH3" in eff_name: simulated_pokemon.perish_turns = 3
+                    elif "PERISH2" in eff_name: simulated_pokemon.perish_turns = 2
+                    elif "PERISH1" in eff_name: simulated_pokemon.perish_turns = 1
+                elif "TRAP" in eff_name:
+                    simulated_pokemon.is_trapped = True
+                elif "IMPRISON" in eff_name:
+                    simulated_pokemon.imprison = True
+
+        if getattr(mon, "last_move", None):
+            simulated_pokemon.last_move_used = clean_id(mon.last_move.id)
+
         return simulated_pokemon
 
 # ----------------- Action Model -----------------
@@ -879,10 +993,10 @@ def step_simulation(
     # 2. Mega Evolution Phase
     for action in player1_actions:
         if action.type == "move" and action.mega and action.slot < len(next_state.side1_active):
-            _trigger_mega(next_state.side1_active[action.slot])
+            _trigger_mega(next_state.side1_active[action.slot], next_state)
     for action in player2_actions:
         if action.type == "move" and action.mega and action.slot < len(next_state.side2_active):
-            _trigger_mega(next_state.side2_active[action.slot])
+            _trigger_mega(next_state.side2_active[action.slot], next_state)
 
     # 3. Collect and Sort Move Executions
     move_execution_queue = []
@@ -891,8 +1005,21 @@ def step_simulation(
     for action in player1_actions:
         if action.type == "move" and action.move_id and action.slot < len(next_state.side1_active):
             user_pokemon = next_state.side1_active[action.slot]
-            if user_pokemon and not user_pokemon.fainted and action.move_id in user_pokemon.moves:
-                move_object = user_pokemon.moves[action.move_id]
+            if user_pokemon and not user_pokemon.fainted:
+                if action.move_id == "struggle":
+                    move_object = SimulatedMove(
+                        move_id="struggle",
+                        name="Struggle",
+                        move_type="normal",
+                        category="physical",
+                        base_power=50.0,
+                        accuracy=100.0,
+                        priority=0,
+                    )
+                elif action.move_id in user_pokemon.moves:
+                    move_object = user_pokemon.moves[action.move_id]
+                else:
+                    continue
                 effective_speed = user_pokemon.calculate_effective_speed(
                     next_state.weather, next_state.fields, next_state.side1_conditions
                 )
@@ -901,8 +1028,21 @@ def step_simulation(
     for action in player2_actions:
         if action.type == "move" and action.move_id and action.slot < len(next_state.side2_active):
             user_pokemon = next_state.side2_active[action.slot]
-            if user_pokemon and not user_pokemon.fainted and action.move_id in user_pokemon.moves:
-                move_object = user_pokemon.moves[action.move_id]
+            if user_pokemon and not user_pokemon.fainted:
+                if action.move_id == "struggle":
+                    move_object = SimulatedMove(
+                        move_id="struggle",
+                        name="Struggle",
+                        move_type="normal",
+                        category="physical",
+                        base_power=50.0,
+                        accuracy=100.0,
+                        priority=0,
+                    )
+                elif action.move_id in user_pokemon.moves:
+                    move_object = user_pokemon.moves[action.move_id]
+                else:
+                    continue
                 effective_speed = user_pokemon.calculate_effective_speed(
                     next_state.weather, next_state.fields, next_state.side2_conditions
                 )
@@ -929,7 +1069,18 @@ def step_simulation(
             user_pokemon.just_flinched = True
             continue
 
-        current_move = user_pokemon.moves.get(action.move_id)
+        if action.move_id == "struggle":
+            current_move = SimulatedMove(
+                move_id="struggle",
+                name="Struggle",
+                move_type="normal",
+                category="physical",
+                base_power=50.0,
+                accuracy=100.0,
+                priority=0,
+            )
+        else:
+            current_move = user_pokemon.moves.get(action.move_id)
         if not current_move:
             continue
 
@@ -965,11 +1116,23 @@ def step_simulation(
             "electricterrain", "grassyterrain", "mistyterrain", "haze", "recover", "roost",
             "slackoff", "softboiled", "milkdrink", "healorder", "wish", "synthesis", "moonlight",
             "morningsun", "lifedew", "howl", "wideguard", "quickguard", "craftyshield",
-            "followme", "ragepowder", "allyswitch", "gravity", "chillyreception", "destinybond"
+            "followme", "ragepowder", "allyswitch", "gravity", "chillyreception", "destinybond",
+            "conversion", "camouflage", "perishsong", "imprison"
         ) or (current_move.id == "curse" and "ghost" not in user_pokemon.types)
 
         if is_self_move:
             targets = [user_pokemon]
+        elif action.move_id == "struggle":
+            opp = opponent_pokemon_list[action.target_idx] if action.target_idx < len(opponent_pokemon_list) else None
+            if not opp or opp.fainted:
+                for o in opponent_pokemon_list:
+                    if o and not o.fainted:
+                        opp = o
+                        break
+            if opp:
+                targets = [opp]
+            else:
+                continue
         elif action.target_idx == 2:
             # Explicit ally target
             if partner and not partner.fainted:
@@ -1036,6 +1199,9 @@ def _execute_switches(state: SimulatedBattleState, actions: list[SimulatedAction
         if action.type == "switch" and action.slot < len(active_pokemon_list) and action.switch_idx < len(bench_pokemon_list):
             switched_out_pokemon = active_pokemon_list[action.slot]
             switched_in_pokemon = bench_pokemon_list[action.switch_idx]
+            if switched_out_pokemon and state.is_pokemon_trapped(switched_out_pokemon):
+                continue  # Blocked from switching due to being trapped!
+
             if switched_in_pokemon and not switched_in_pokemon.fainted:
                 # Reset boosts and volatile conditions on switch out
                 if switched_out_pokemon:
@@ -1052,11 +1218,24 @@ def _execute_switches(state: SimulatedBattleState, actions: list[SimulatedAction
                     switched_out_pokemon.last_move_used = None
                     switched_out_pokemon.protect_counter = 0
                     switched_out_pokemon.is_protected = False
+                    switched_out_pokemon.types = switched_out_pokemon.base_types
+                    switched_out_pokemon.roost_active = False
+                    switched_out_pokemon.protean_activated = False
+                    switched_out_pokemon.flinch = False
+                    switched_out_pokemon.just_flinched = False
+                    switched_out_pokemon.perish_turns = 0
+                    switched_out_pokemon.is_trapped = False
+                    switched_out_pokemon.imprison = False
+                    switched_out_pokemon.slot = -1
                     bench_pokemon_list[action.switch_idx] = switched_out_pokemon
 
                 switched_in_pokemon.first_turn = True
                 switched_in_pokemon.protect_counter = 0
                 switched_in_pokemon.is_protected = False
+                switched_in_pokemon.protean_activated = False
+                switched_in_pokemon.flinch = False
+                switched_in_pokemon.just_flinched = False
+                switched_in_pokemon.slot = action.slot
                 active_pokemon_list[action.slot] = switched_in_pokemon
 
                 # Intimidate trigger
@@ -1071,26 +1250,40 @@ def _execute_switches(state: SimulatedBattleState, actions: list[SimulatedAction
                                 else:
                                     opponent_pokemon.apply_boost("atk", -1)
 
-def _trigger_mega(pokemon: Optional[SimulatedPokemon]) -> None:
+def _trigger_mega(pokemon: Optional[SimulatedPokemon], state: Optional[SimulatedBattleState] = None) -> None:
     if not pokemon or pokemon.is_mega or pokemon.fainted:
         return
+    if state is not None:
+        if pokemon.side == 1 and state.side1_mega_used:
+            return
+        if pokemon.side == 2 and state.side2_mega_used:
+            return
     cleaned_species = pokemon.species
-    mega_species = None
     mega_stones = constants.BASE_TO_MEGA_STONE.get(cleaned_species, [])
-    if mega_stones:
-        for candidate_mega_species, stone_name in constants.MEGA_TO_MEGA_STONE.items():
-            if stone_name in mega_stones and (candidate_mega_species.startswith(cleaned_species) or cleaned_species in candidate_mega_species):
-                mega_species = candidate_mega_species
-                break
+    if not mega_stones and cleaned_species != "rayquaza":
+        return
+    if cleaned_species != "rayquaza" and pokemon.item not in mega_stones:
+        return
+    mega_species = None
+    for candidate_mega_species, stone_name in constants.MEGA_TO_MEGA_STONE.items():
+        if stone_name in mega_stones and (candidate_mega_species.startswith(cleaned_species) or cleaned_species in candidate_mega_species):
+            mega_species = candidate_mega_species
+            break
 
     if mega_species and mega_species in constants.MEGA_SPECIES_STATS:
         mega_data = constants.MEGA_SPECIES_STATS[mega_species]
         pokemon.species = mega_species
         pokemon.types = tuple(clean_id(type_name) for type_name in mega_data["types"])
+        pokemon.base_types = pokemon.types
         pokemon.ability = clean_id(mega_data["ability"])
         pokemon.base_stats = mega_data["base_stats"]
         pokemon.stats = pokemon._calculate_stats_from_base()
         pokemon.is_mega = True
+        if state is not None:
+            if pokemon.side == 1:
+                state.side1_mega_used = True
+            else:
+                state.side2_mega_used = True
 
 def _execute_single_move(
     state: SimulatedBattleState,
@@ -1103,17 +1296,34 @@ def _execute_single_move(
     if attacker.fainted or target.fainted:
         return
 
+    if attacker.slot not in (0, 1):
+        active_list = state.side1_active if attacker.side == 1 else state.side2_active
+        if attacker in active_list:
+            attacker.slot = active_list.index(attacker)
+
     is_ally = (target.side == attacker.side and target != attacker)
 
-    # 1. Attacker volatile restrictions (Taunt, Disable, Encore, Torment)
-    if attacker.taunt_turns > 0 and move.category == "status":
-        return
-    if attacker.disable_turns > 0 and move.id == attacker.disabled_move:
-        return
-    if attacker.encore_turns > 0 and attacker.encore_move and move.id != attacker.encore_move:
-        return
-    if attacker.torment and attacker.last_move_used and move.id == attacker.last_move_used:
-        return
+    # 1. Attacker volatile & item restrictions (Taunt, Disable, Encore, Torment, Choice lock, Assault Vest, Imprison)
+    if move.id != "struggle":
+        if attacker.taunt_turns > 0 and move.category == "status":
+            return
+        if attacker.item == "assaultvest" and move.category == "status":
+            return
+        if attacker.disable_turns > 0 and move.id == attacker.disabled_move:
+            return
+        if attacker.encore_turns > 0 and attacker.encore_move and move.id != attacker.encore_move:
+            return
+        if attacker.torment and attacker.last_move_used and move.id == attacker.last_move_used:
+            return
+        if attacker.item in ("choiceband", "choicespecs", "choicescarf"):
+            if attacker.last_move_used and attacker.last_move_used in attacker.moves and move.id != attacker.last_move_used:
+                return
+
+        # Imprison restriction: cannot use any move that an active opposing Imprison user knows
+        opponents = state.side2_active if attacker.side == 1 else state.side1_active
+        for opp in opponents:
+            if opp and not opp.fainted and opp.imprison and move.id in opp.moves:
+                return
 
     # 2. Defensive shield protections (Protect, Wide Guard, Quick Guard, Crafty Shield)
     if target.is_protected and "protect" in move.flags and not is_ally:
@@ -1164,13 +1374,15 @@ def _execute_single_move(
         return
     elif move.id == "lifedew":
         attacker.heal(attacker.max_hp * 0.25)
-        partner = state.side1_active[1 - attacker.slot] if attacker.side == 1 else state.side2_active[1 - attacker.slot]
+        active_list = state.side1_active if attacker.side == 1 else state.side2_active
+        partner = next((p for p in active_list if p is not None and p != attacker), None)
         if partner and not partner.fainted:
             partner.heal(partner.max_hp * 0.25)
         return
     elif move.id == "howl":
         attacker.apply_boost("atk", 1)
-        partner = state.side1_active[1 - attacker.slot] if attacker.side == 1 else state.side2_active[1 - attacker.slot]
+        active_list = state.side1_active if attacker.side == 1 else state.side2_active
+        partner = next((p for p in active_list if p is not None and p != attacker), None)
         if partner and not partner.fainted:
             partner.apply_boost("atk", 1)
         return
@@ -1333,8 +1545,13 @@ def _execute_single_move(
                 target.status = "tox"
 
         # Direct Healing
-        elif move.id in ("recover", "roost", "slackoff", "softboiled", "milkdrink", "healorder", "wish"):
+        elif move.id in ("recover", "slackoff", "softboiled", "milkdrink", "healorder", "wish"):
             attacker.heal(attacker.max_hp * 0.50)
+        elif move.id == "roost":
+            attacker.heal(attacker.max_hp * 0.50)
+            if "flying" in attacker.types:
+                attacker.types = tuple(t for t in attacker.types if t != "flying")
+                attacker.roost_active = True
         elif move.id in ("synthesis", "moonlight", "morningsun"):
             heal_rate = 0.66 if "sunnyday" in state.weather else (0.25 if any(w in state.weather for w in ("raindance", "sandstorm", "snowscape", "hail")) else 0.50)
             attacker.heal(attacker.max_hp * heal_rate)
@@ -1420,6 +1637,40 @@ def _execute_single_move(
         elif move.id == "tickle":
             target.apply_boost("atk", -1)
             target.apply_boost("def", -1)
+        elif move.id == "soak":
+            target.types = ("water",)
+        elif move.id == "magicpowder":
+            target.types = ("psychic",)
+        elif move.id == "forestscurse":
+            if "grass" not in target.types:
+                target.types = target.types + ("grass",)
+        elif move.id == "trickortreat":
+            if "ghost" not in target.types:
+                target.types = target.types + ("ghost",)
+        elif move.id == "reflecttype":
+            if target and not target.fainted and target.types:
+                attacker.types = target.types
+        elif move.id == "conversion":
+            if attacker.moves:
+                first_move = next(iter(attacker.moves.values()))
+                if first_move.type:
+                    attacker.types = (first_move.type,)
+        elif move.id == "camouflage":
+            if "electricterrain" in state.fields: attacker.types = ("electric",)
+            elif "grassyterrain" in state.fields: attacker.types = ("grass",)
+            elif "psychicterrain" in state.fields: attacker.types = ("psychic",)
+            elif "mistyterrain" in state.fields: attacker.types = ("fairy",)
+            else: attacker.types = ("normal",)
+        elif move.id == "perishsong":
+            for active_pkmn in state.side1_active + state.side2_active:
+                if active_pkmn and not active_pkmn.fainted and active_pkmn.ability != "soundproof":
+                    if active_pkmn.perish_turns == 0:
+                        active_pkmn.perish_turns = 3
+        elif move.id in ("meanlook", "block", "spiderweb"):
+            if not is_ally and "ghost" not in target.types and target.item != "shedshell":
+                target.is_trapped = True
+        elif move.id == "imprison":
+            attacker.imprison = True
         return
 
     # 3. Dynamic Base Power & Move Typing
@@ -1484,21 +1735,72 @@ def _execute_single_move(
             base_power = 120.0
     elif move.id == "hardpress":
         base_power = max(1.0, math.floor(100.0 * target.current_hp_fraction))
+    elif move.id == "revelationdance":
+        if attacker.types:
+            effective_type = attacker.types[0]
+    elif move.id == "aurawheel":
+        effective_type = "electric"
+    elif move.id == "ragingbull":
+        if "fire" in attacker.species:
+            effective_type = "fire"
+        elif "water" in attacker.species:
+            effective_type = "water"
+        else:
+            effective_type = "fighting"
+    elif move.id == "ivyudgel":
+        if "hearthflame" in attacker.species or attacker.item == "hearthflamemask":
+            effective_type = "fire"
+        elif "wellspring" in attacker.species or attacker.item == "wellspringmask":
+            effective_type = "water"
+        elif "cornerstone" in attacker.species or attacker.item == "cornerstonemask":
+            effective_type = "rock"
+        else:
+            effective_type = "grass"
 
     if base_power <= 0:
         return
 
-    # Normal-type conversion abilities
+    # Double Shock & Burn Up: fail if user lacks corresponding type; strip type on use
+    had_electric_stab = False
+    had_fire_stab = False
+    if move.id == "doubleshock":
+        if "electric" not in attacker.types:
+            return  # Move fails if user is not Electric type
+        had_electric_stab = True
+        attacker.types = tuple(t for t in attacker.types if t != "electric")
+    elif move.id == "burnup":
+        if "fire" not in attacker.types:
+            return  # Move fails if user is not Fire type
+        had_fire_stab = True
+        attacker.types = tuple(t for t in attacker.types if t != "fire")
+
+    # Normal-type conversion abilities & move-type altering abilities
     base_power_multiplier = 1.0
     if effective_type == "normal":
         if attacker.ability == "pixilate": effective_type, base_power_multiplier = "fairy", 1.2
         elif attacker.ability == "aerilate": effective_type, base_power_multiplier = "flying", 1.2
         elif attacker.ability == "refrigerate": effective_type, base_power_multiplier = "ice", 1.2
         elif attacker.ability == "galvanize": effective_type, base_power_multiplier = "electric", 1.2
+    if attacker.ability == "normalize":
+        effective_type, base_power_multiplier = "normal", 1.2
+    elif attacker.ability == "liquidvoice" and move.id in _SOUND_MOVES:
+        effective_type = "water"
+
+    # Protean / Libero (changes user's type to move type before STAB/damage)
+    if attacker.ability in ("protean", "libero") and not attacker.protean_activated:
+        attacker.types = (effective_type,)
+        attacker.protean_activated = True
 
     has_gravity = ("gravity" in state.fields)
     # Type effectiveness & Scrappy
-    type_multiplier = target.damage_multiplier(effective_type, has_gravity=has_gravity)
+    if move.id == "struggle":
+        type_multiplier = 1.0  # Struggle deals typeless damage, hits Ghost-types neutrally
+    else:
+        type_multiplier = target.damage_multiplier(effective_type, has_gravity=has_gravity)
+    if move.id == "freezedry" and "water" in target.types:
+        type_multiplier *= 4.0  # Ice vs Water becomes 2.0x instead of 0.5x
+    elif move.id == "thousandarrows" and "flying" in target.types and type_multiplier == 0.0:
+        type_multiplier = 1.0
     if type_multiplier == 0.0:
         if attacker.ability == "scrappy" and effective_type in ("normal", "fighting"):
             type_multiplier = 1.0
@@ -1516,7 +1818,7 @@ def _execute_single_move(
 
     # STAB calculation
     same_type_attack_bonus = 1.0
-    if effective_type in attacker.types:
+    if effective_type in attacker.types or (move.id == "doubleshock" and had_electric_stab) or (move.id == "burnup" and had_fire_stab):
         same_type_attack_bonus = 2.0 if attacker.ability == "adaptability" else 1.5
 
     # Attack and Defense Stat Resolution
@@ -1604,6 +1906,19 @@ def _execute_single_move(
 
     # Rage Fist hit counter tracking
     state.hit_counts[target.species] = state.hit_counts.get(target.species, 0) + 1
+
+    # Color Change ability on target
+    if target.ability == "colorchange" and not target.fainted and effective_type:
+        target.types = (effective_type,)
+
+    # Trapping binding moves (Fire Spin, Whirlpool, Sand Tomb, Magma Storm, Infestation, Snap Trap, Anchor Shot, Jaw Lock, Thousand Waves)
+    if move.id in ("firespin", "whirlpool", "sandtomb", "magmastorm", "infestation", "snaptrap", "anchorshot", "jawlock", "thousandwaves"):
+        if "ghost" not in target.types and target.item != "shedshell" and not target.fainted:
+            target.is_trapped = True
+
+    # Struggle recoil (25% of max HP)
+    if move.id == "struggle":
+        attacker.take_damage(attacker.max_hp * 0.25)
 
     # Recoil & Life Orb
     if attacker.item == "lifeorb":
@@ -1698,11 +2013,18 @@ def _execute_end_of_turn(state: SimulatedBattleState) -> None:
                 pokemon.disabled_move = None
         if pokemon.cursed:
             pokemon.take_damage(pokemon.max_hp * 0.25)
+        if pokemon.perish_turns > 0:
+            pokemon.perish_turns -= 1
+            if pokemon.perish_turns == 0:
+                pokemon.take_damage(pokemon.max_hp)
 
         pokemon.first_turn = False
         pokemon.flinch = False
         pokemon.helping_hand = False
         pokemon.destiny_bond = False
+        if pokemon.roost_active:
+            pokemon.types = pokemon.base_types
+            pokemon.roost_active = False
 
     # Decrement Field and Condition Timers
     for condition_name in list(state.weather.keys()):

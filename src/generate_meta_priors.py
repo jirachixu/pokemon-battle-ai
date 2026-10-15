@@ -121,7 +121,6 @@ def generate_champions_priors():
 
     with open(OUTPUT_FILE_PATH, "w", encoding="utf-8") as output_file_handle:
         output_file_handle.write("# Automatically extracted empirical priors for Pokemon Champions Regulation M-C VGC\n")
-        output_file_handle.write("# Sourced strictly from tournament team files in teams/ without any SV VGC assumptions.\n\n")
         output_file_handle.write("import re\n\n")
 
         output_file_handle.write("CHAMPIONS_MOVE_PRIORS = {\n")
