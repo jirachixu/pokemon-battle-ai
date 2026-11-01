@@ -10,7 +10,7 @@ import torch
 from itertools import combinations
 
 from src.search import LookaheadSearch
-from src.evaluator import BattleStateEvaluator, CompetitiveHeuristicEvaluator
+from src.evaluator import BattleStateEvaluator, CompetitiveHeuristicEvaluator, NeuralValueEvaluator
 from src.state_encoder import TeamPreviewEncoder
 from src.models import TeamPreviewModel
 
@@ -76,7 +76,8 @@ class LookaheadPlayer(Player):
     def __init__(
         self,
         depth: int = 2,
-        max_candidates: int = 10,
+        max_candidates: int = 8,
+        model = None,
         evaluator: Optional[BattleStateEvaluator] = None,
         team_preview_encoder: Optional[TeamPreviewEncoder] = None,
         team_preview_model: Optional[TeamPreviewModel] = None,
@@ -88,8 +89,9 @@ class LookaheadPlayer(Player):
             kwargs["account_configuration"] = AccountConfiguration(f"Lookahead_{uuid.uuid4().hex[:6]}", None)
         kwargs.pop("method", None)
         super().__init__(*args, **kwargs)
+        self.model = model
         self.searcher = LookaheadSearch(
-            evaluator=evaluator or CompetitiveHeuristicEvaluator(),
+            evaluator=evaluator or NeuralValueEvaluator(model=model) if model is not None else CompetitiveHeuristicEvaluator(),
             depth=depth,
             max_candidates=max_candidates,
         )

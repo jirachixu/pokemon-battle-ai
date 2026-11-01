@@ -5,19 +5,29 @@ Evaluates board states from Player 1's perspective.
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import List, Optional, Any, overload
 import torch
+import numpy as np
 
-from src.simulation import SimulatedBattleState, SimulatedPokemon, SimulatedMove, clean_id
+from src.simulation import (
+    SimulatedBattleState,
+    SimulatedPokemon,
+    SimulatedMove,
+    clean_id,
+    is_pokemon_grounded,
+    is_charge_move_instant,
+    get_effective_move_priority,
+    _SOUND_MOVES,
+    _TWO_TURN_CHARGE_MOVES,
+)
 from src.state_encoder import StateEncoder
 
 class BattleStateEvaluator(ABC):
     """Abstract base class for all battle state evaluators."""
-
     @abstractmethod
-    def evaluate(self, state: SimulatedBattleState) -> float:
+    def evaluate(self, state: SimulatedBattleState | List[SimulatedBattleState]) -> torch.Tensor:
         """Computes evaluation score for state. Higher is better for Side 1."""
-        raise NotImplementedError
+        ...
 
 class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
     """
@@ -45,7 +55,13 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         self.weight_status_penalty = weight_status_penalty
         self.weight_threat_pressure = weight_threat_pressure
         self.weight_flinch = weight_flinch
-    def evaluate(self, state: SimulatedBattleState) -> float:
+
+    def evaluate(self, state: SimulatedBattleState | List[SimulatedBattleState]) -> torch.Tensor:
+        if isinstance(state, list):
+            return torch.tensor([self._evaluate_single(s) for s in state], dtype=torch.float32)
+        return torch.tensor(self._evaluate_single(state), dtype=torch.float32)
+
+    def _evaluate_single(self, state: SimulatedBattleState) -> float:
         """Computes evaluation score for state. Higher is better for Side 1."""
         winner_side = state.winner()
         if winner_side == 1:
@@ -57,84 +73,93 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
 
         evaluation_score = 0.0
 
-        side1_alive_count = state.alive_side1_count()
-        side2_alive_count = state.alive_side2_count()
+        team_alive_count = state.alive_team_count()
+        opp_alive_count = state.alive_opponent_count()
 
         # 1. Material (Remaining Pokemon) Advantage
-        evaluation_score += self.weight_alive_differential * (side1_alive_count - side2_alive_count)
+        evaluation_score += self.weight_alive_differential * (team_alive_count - opp_alive_count)
 
         # 2. HP Differential
-        side1_total_hp = sum(pokemon.current_hp_fraction for pokemon in state.all_side1_pokemon() if not pokemon.fainted)
-        side2_total_hp = sum(pokemon.current_hp_fraction for pokemon in state.all_side2_pokemon() if not pokemon.fainted)
-        evaluation_score += self.weight_hp_differential * (side1_total_hp - side2_total_hp)
+        team_total_hp = sum(pokemon.current_hp_fraction for pokemon in state.all_team_pokemon() if not pokemon.fainted)
+        opp_total_hp = (
+            sum(pokemon.current_hp_fraction for pokemon in state.all_opponent_pokemon() if not pokemon.fainted)
+            + float(getattr(state, "unrevealed_opponent_count", 0))
+        )
+        evaluation_score += self.weight_hp_differential * (team_total_hp - opp_total_hp)
 
         # Active HP priority: active Pokemon on field are more immediately impactful than bench
-        side1_active_hp = sum(pokemon.current_hp_fraction for pokemon in state.side1_active if pokemon and not pokemon.fainted)
-        side2_active_hp = sum(pokemon.current_hp_fraction for pokemon in state.side2_active if pokemon and not pokemon.fainted)
-        evaluation_score += (self.weight_hp_differential * 0.5) * (side1_active_hp - side2_active_hp)
+        team_active_hp = sum(pokemon.current_hp_fraction for pokemon in state.active_pokemon if pokemon and not pokemon.fainted)
+        opp_active_hp = sum(pokemon.current_hp_fraction for pokemon in state.opponent_active_pokemon if pokemon and not pokemon.fainted)
+        evaluation_score += (self.weight_hp_differential * 0.5) * (team_active_hp - opp_active_hp)
 
         # 3. Speed Control & Field Advantage
         is_trick_room_active = "trickroom" in state.fields
-        side1_tailwind_turns = state.side1_conditions.get("tailwind", 0)
-        side2_tailwind_turns = state.side2_conditions.get("tailwind", 0)
-        evaluation_score += self.weight_speed_control * (side1_tailwind_turns - side2_tailwind_turns)
+        team_tailwind_turns = state.side_conditions.get("tailwind", 0)
+        opp_tailwind_turns = state.opponent_side_conditions.get("tailwind", 0)
+        evaluation_score += self.weight_speed_control * (team_tailwind_turns - opp_tailwind_turns)
 
         # Active speed order comparison
-        side1_living_active = [pokemon for pokemon in state.side1_active if pokemon and not pokemon.fainted]
-        side2_living_active = [pokemon for pokemon in state.side2_active if pokemon and not pokemon.fainted]
+        team_living_active = [pokemon for pokemon in state.active_pokemon if pokemon and not pokemon.fainted]
+        opp_living_active = [pokemon for pokemon in state.opponent_active_pokemon if pokemon and not pokemon.fainted]
 
-        if side1_living_active and side2_living_active:
-            side1_effective_speeds = [
-                pokemon.calculate_effective_speed(state.weather, state.fields, state.side1_conditions)
-                for pokemon in side1_living_active
+        if team_living_active and opp_living_active:
+            team_effective_speeds = [
+                pokemon.calculate_effective_speed(state.weather, state.fields, state.side_conditions)
+                for pokemon in team_living_active
             ]
-            side2_effective_speeds = [
-                pokemon.calculate_effective_speed(state.weather, state.fields, state.side2_conditions)
-                for pokemon in side2_living_active
+            opp_effective_speeds = [
+                pokemon.calculate_effective_speed(state.weather, state.fields, state.opponent_side_conditions)
+                for pokemon in opp_living_active
             ]
 
-            max_side1_speed = max(side1_effective_speeds)
-            max_side2_speed = max(side2_effective_speeds)
+            max_team_speed = max(team_effective_speeds)
+            max_opp_speed = max(opp_effective_speeds)
 
             if is_trick_room_active:
                 # Slower speeds move first under Trick Room
-                min_side1_speed = min(side1_effective_speeds)
-                min_side2_speed = min(side2_effective_speeds)
-                if min_side1_speed < min_side2_speed:
+                min_team_speed = min(team_effective_speeds)
+                min_opp_speed = min(opp_effective_speeds)
+                if min_team_speed < min_opp_speed:
                     evaluation_score += self.weight_speed_control * 0.8
                 else:
                     evaluation_score -= self.weight_speed_control * 0.8
             else:
-                if max_side1_speed > max_side2_speed:
+                if max_team_speed > max_opp_speed:
                     evaluation_score += self.weight_speed_control * 0.8
                 else:
                     evaluation_score -= self.weight_speed_control * 0.8
 
         # 4. Stat Boosts Advantage
-        for pokemon in state.all_side1_pokemon():
+        for pokemon in state.all_team_pokemon():
             if not pokemon.fainted:
                 evaluation_score += self._evaluate_pokemon_boosts(pokemon)
-        for pokemon in state.all_side2_pokemon():
+        for pokemon in state.all_opponent_pokemon():
             if not pokemon.fainted:
                 evaluation_score -= self._evaluate_pokemon_boosts(pokemon)
 
         # 5. Status Conditions Penalty
-        for pokemon in state.all_side1_pokemon():
+        for pokemon in state.all_team_pokemon():
             if not pokemon.fainted:
                 evaluation_score -= self._evaluate_status_penalty(pokemon)
-        for pokemon in state.all_side2_pokemon():
+        for pokemon in state.all_opponent_pokemon():
             if not pokemon.fainted:
                 evaluation_score += self._evaluate_status_penalty(pokemon)
         # 5.1. Flinch Penalty
-        for pokemon in state.all_side1_pokemon():
+        for pokemon in state.all_team_pokemon():
             if not pokemon.fainted:
                 evaluation_score -= self._evaluate_flinch_penalty(pokemon)
-        for pokemon in state.all_side2_pokemon():
+        for pokemon in state.all_opponent_pokemon():
             if not pokemon.fainted:
                 evaluation_score += self._evaluate_flinch_penalty(pokemon)
 
+        # 5.2. Perish Song & Trapping Penalty (Active Pokemon)
+        for pokemon in team_living_active:
+            evaluation_score -= self._evaluate_perish_and_trapping_penalty(pokemon, state)
+        for pokemon in opp_living_active:
+            evaluation_score += self._evaluate_perish_and_trapping_penalty(pokemon, state)
+
         # 6. Immediate Lethal KO Threat Evaluation
-        evaluation_score += self._evaluate_threat_matrix(side1_living_active, side2_living_active, state)
+        evaluation_score += self._evaluate_threat_matrix(team_living_active, opp_living_active, state)
 
         return evaluation_score
 
@@ -184,20 +209,20 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
 
     def _evaluate_threat_matrix(
         self,
-        side1_active: list[SimulatedPokemon],
-        side2_active: list[SimulatedPokemon],
+        active_pokemon: list[SimulatedPokemon],
+        opponent_active_pokemon: list[SimulatedPokemon],
         state: SimulatedBattleState
     ) -> float:
         """Evaluates whether active Pokemon threaten immediate 1HKOs or 2HKOs."""
         threat_score = 0.0
 
-        for user_pokemon in side1_active:
-            for opponent_pokemon in side2_active:
+        for user_pokemon in active_pokemon:
+            for opponent_pokemon in opponent_active_pokemon:
                 if self._can_knock_out(user_pokemon, opponent_pokemon, state):
                     threat_score += self.weight_threat_pressure
 
-        for opponent_pokemon in side2_active:
-            for user_pokemon in side1_active:
+        for opponent_pokemon in opponent_active_pokemon:
+            for user_pokemon in active_pokemon:
                 if self._can_knock_out(opponent_pokemon, user_pokemon, state):
                     threat_score -= self.weight_threat_pressure
 
@@ -212,21 +237,188 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         """Fast check if attacker has any damaging move capable of reducing target to 0 HP."""
         if target.protect_counter > 0:
             return False
+
+        ignores_ability = attacker.ability in ("moldbreaker", "teravolt", "turboblaze")
+        target_eff_ability = (
+            target.ability
+            if (not ignores_ability or target.ability in ("fullmetalbody", "shadowshield", "prismarmor", "comatose"))
+            else ""
+        )
+        was_at_full_hp = (target.current_hp >= target.max_hp - 1e-6)
+        if was_at_full_hp and target.max_hp > 1.0 and (target_eff_ability == "sturdy" or target.item == "focussash"):
+            return False  # Cannot 1-hit KO through intact Sturdy or Focus Sash
+
+        all_active = [p for p in state.active_pokemon + state.opponent_active_pokemon if p and not p.fainted]
+        target_side_conditions = state.opponent_side_conditions if target.side == 2 else state.side_conditions
+
         for move in attacker.moves.values():
-            if move.category == "status" or move.base_power <= 0:
+            if move.category == "status":
                 continue
+            if attacker.charging_move and move.id != attacker.charging_move:
+                continue
+            if move.id in ("fakeout", "firstimpression") and not attacker.first_turn:
+                continue
+            if attacker.throat_chop_turns > 0 and ("sound" in move.flags or move.id in _SOUND_MOVES):
+                continue
+            if (move.id in _TWO_TURN_CHARGE_MOVES or "charge" in move.flags) and not is_charge_move_instant(move.id, attacker, state.weather):
+                continue  # Requires a charge turn first, cannot 1-turn KO right now
+            if target_eff_ability == "soundproof" and ("sound" in move.flags or move.id in _SOUND_MOVES):
+                continue
+            if target_eff_ability == "bulletproof" and "bullet" in move.flags:
+                continue
+
+            eff_priority = get_effective_move_priority(move, attacker, state.fields)
+            if eff_priority > 0:
+                if "psychicterrain" in state.fields and is_pokemon_grounded(target, state.fields, ignore_ability=ignores_ability):
+                    continue
+                if not ignores_ability and target.ability in ("dazzling", "queenlymajesty", "armortail"):
+                    continue
+
+            base_power = move.base_power
             effective_type = move.type
-            type_multiplier = target.damage_multiplier(effective_type)
-            if type_multiplier == 0.0:
+
+            if move.id == "expandingforce" and "psychicterrain" in state.fields and is_pokemon_grounded(attacker, state.fields):
+                base_power = 120.0
+            elif move.id == "risingvoltage" and "electricterrain" in state.fields and is_pokemon_grounded(target, state.fields, ignore_ability=ignores_ability):
+                base_power = 140.0
+            elif move.id == "psyblade" and "electricterrain" in state.fields:
+                base_power = 120.0
+            elif move.id == "mistyexplosion" and "mistyterrain" in state.fields and is_pokemon_grounded(attacker, state.fields):
+                base_power = 150.0
+            elif move.id == "weatherball":
+                if any(w in state.weather for w in ("sunnyday", "desolateland", "sun")) or attacker.ability == "megasol":
+                    base_power, effective_type = 100.0, "fire"
+                elif any(w in state.weather for w in ("raindance", "primordialsea", "rain")):
+                    base_power, effective_type = 100.0, "water"
+                elif any(w in state.weather for w in ("sandstorm", "sand")):
+                    base_power, effective_type = 100.0, "rock"
+                elif any(w in state.weather for w in ("snowscape", "hail", "snow")):
+                    base_power, effective_type = 100.0, "ice"
+            elif move.id == "terrainpulse" and is_pokemon_grounded(attacker, state.fields):
+                if "electricterrain" in state.fields: base_power, effective_type = 100.0, "electric"
+                elif "grassyterrain" in state.fields: base_power, effective_type = 100.0, "grass"
+                elif "psychicterrain" in state.fields: base_power, effective_type = 100.0, "psychic"
+                elif "mistyterrain" in state.fields: base_power, effective_type = 100.0, "fairy"
+
+            if base_power <= 0:
                 continue
-            same_type_attack_bonus = 1.5 if effective_type in attacker.types else 1.0
+
+            if effective_type == "normal":
+                if attacker.ability == "pixilate": effective_type, base_power = "fairy", base_power * 1.2
+                elif attacker.ability == "aerilate": effective_type, base_power = "flying", base_power * 1.2
+                elif attacker.ability == "refrigerate": effective_type, base_power = "ice", base_power * 1.2
+                elif attacker.ability == "galvanize": effective_type, base_power = "electric", base_power * 1.2
+                elif attacker.ability == "dragonize": effective_type, base_power = "dragon", base_power * 1.2
+
+            has_gravity = ("gravity" in state.fields)
+            type_multiplier = target.damage_multiplier(effective_type, has_gravity=has_gravity)
+            if type_multiplier == 0.0:
+                if attacker.ability in ("scrappy", "mindseye") and effective_type in ("normal", "fighting"):
+                    type_multiplier = 1.0
+                else:
+                    continue
+
+            if effective_type == "ground" and target_eff_ability in ("levitate", "eelevate", "eartheater") and not is_pokemon_grounded(target, state.fields, ignore_ability=ignores_ability):
+                continue
+            if effective_type == "ground" and target_eff_ability == "eartheater":
+                continue
+            if effective_type == "fire" and target_eff_ability in ("flashfire", "wellbakedbody"):
+                continue
+            if effective_type == "water" and target_eff_ability in ("waterabsorb", "stormdrain", "dryskin"):
+                continue
+            if effective_type == "electric" and target_eff_ability in ("voltabsorb", "lightningrod", "motordrive"):
+                continue
+            if effective_type == "grass" and target_eff_ability == "sapsipper":
+                continue
+
+            if target_eff_ability == "terashell" and was_at_full_hp and type_multiplier > 0.0:
+                type_multiplier = 0.5
+
+            same_type_attack_bonus = (2.0 if attacker.ability == "adaptability" else 1.5) if effective_type in attacker.types else 1.0
             is_special = (move.category == "special")
-            attacker_stat = attacker.calculate_effective_attack(is_special, state.weather, state.fields)
-            defender_stat = target.calculate_effective_defense(is_special, state.weather, state.fields)
+            ignore_target_def_boosts = (attacker.ability == "unaware")
+            ignore_attacker_atk_boosts = (target_eff_ability == "unaware")
+
+            attacker_stat = attacker.calculate_effective_attack(
+                is_special, state.weather, state.fields, ignore_boosts=ignore_attacker_atk_boosts
+            )
+            if move.id in ("electroshot", "meteorbeam") and attacker.charging_move != move.id and not ignore_attacker_atk_boosts:
+                attacker_stat *= 1.5  # +1 SpA boost applied before 1-turn execution
+            defender_stat = target.calculate_effective_defense(
+                is_special, state.weather, state.fields, ignore_boosts=ignore_target_def_boosts, ignore_ability=ignores_ability
+            )
+
+            # Ruinous Quartet field reductions
+            if not is_special:
+                if attacker.ability != "tabletsofruin" and any(p.ability == "tabletsofruin" for p in all_active):
+                    attacker_stat *= 0.75
+                if target.ability != "swordofruin" and any(p.ability == "swordofruin" for p in all_active):
+                    defender_stat *= 0.75
+            else:
+                if attacker.ability != "vesselofruin" and any(p.ability == "vesselofruin" for p in all_active):
+                    attacker_stat *= 0.75
+                if target.ability != "beadsofruin" and any(p.ability == "beadsofruin" for p in all_active):
+                    defender_stat *= 0.75
+
+            field_mult = 1.0
+            has_aura_break = any(p.ability == "aurabreak" for p in all_active)
+            if effective_type == "fairy" and any(p.ability == "fairyaura" for p in all_active):
+                field_mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+            elif effective_type == "dark" and any(p.ability == "darkaura" for p in all_active):
+                field_mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+
+            is_sunny = any(w in state.weather for w in ("sunnyday", "desolateland", "sun")) or attacker.ability == "megasol"
+            is_rainy = any(w in state.weather for w in ("raindance", "primordialsea", "rain")) and attacker.ability != "megasol"
+            is_bad_solar_weather = (
+                any(w in state.weather for w in ("raindance", "primordialsea", "rain", "sandstorm", "sand", "snowscape", "hail", "snow"))
+                and attacker.ability != "megasol"
+            )
+            if move.id in ("solarbeam", "solarblade") and is_bad_solar_weather:
+                field_mult *= 0.5
+            if effective_type == "fire":
+                if is_sunny: field_mult *= 1.5
+                elif is_rainy: field_mult *= 0.5
+            elif effective_type == "water":
+                if move.id == "hydrosteam" and is_sunny: field_mult *= 1.5
+                elif is_rainy: field_mult *= 1.5
+                elif is_sunny: field_mult *= 0.5
+
+            if is_pokemon_grounded(attacker, state.fields):
+                if "psychicterrain" in state.fields and effective_type == "psychic": field_mult *= 1.3
+                elif "electricterrain" in state.fields and effective_type == "electric": field_mult *= 1.3
+                elif "grassyterrain" in state.fields and effective_type == "grass": field_mult *= 1.3
+            if is_pokemon_grounded(target, state.fields, ignore_ability=ignores_ability):
+                if "mistyterrain" in state.fields and effective_type == "dragon":
+                    field_mult *= 0.5
+                if "grassyterrain" in state.fields and move.id in ("earthquake", "bulldoze", "magnitude"):
+                    field_mult *= 0.5
+
+            # Defensive ability & screen reductions
+            if target_eff_ability in ("multiscale", "shadowshield") and was_at_full_hp:
+                field_mult *= 0.5
+            if target_eff_ability == "thickfat" and effective_type in ("fire", "ice"):
+                field_mult *= 0.5
+            elif target_eff_ability in ("heatproof", "waterbubble") and effective_type == "fire":
+                field_mult *= 0.5
+            elif target_eff_ability == "purifyingsalt" and effective_type == "ghost":
+                field_mult *= 0.5
+            if target_eff_ability == "fluffy":
+                if "contact" in move.flags and attacker.item != "protectivepads":
+                    field_mult *= 0.5
+                if effective_type == "fire":
+                    field_mult *= 2.0
+            if target_eff_ability in ("filter", "solidrock", "prismarmor") and type_multiplier > 1.0:
+                field_mult *= 0.75
+
+            if attacker.ability != "infiltrator" and move.id not in ("brickbreak", "psychicfangs", "ragingbull"):
+                if not is_special and ("reflect" in target_side_conditions or "auroraveil" in target_side_conditions):
+                    field_mult *= 0.66
+                elif is_special and ("lightscreen" in target_side_conditions or "auroraveil" in target_side_conditions):
+                    field_mult *= 0.66
 
             estimated_damage = (
-                ((22.0 * move.base_power * (attacker_stat / max(1.0, defender_stat))) / 50.0) + 2.0
-            ) * same_type_attack_bonus * type_multiplier
+                ((22.0 * base_power * (attacker_stat / max(1.0, defender_stat))) / 50.0) + 2.0
+            ) * same_type_attack_bonus * field_mult * type_multiplier
             if estimated_damage >= target.current_hp:
                 return True
         return False
@@ -251,56 +443,155 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         if pokemon.just_flinched:
             return self.weight_flinch
         return 0.0
+
+    def _evaluate_perish_and_trapping_penalty(
+        self,
+        pokemon: SimulatedPokemon,
+        state: SimulatedBattleState,
+    ) -> float:
+        """Evaluates the danger of active Perish Song countdowns and trapping effects."""
+        penalty = 0.0
+        is_trapped = state.is_pokemon_trapped(pokemon)
+        bench_list = state.bench if pokemon.side == 1 else state.opponent_bench
+        has_alive_bench = any(b is not None and not b.fainted for b in bench_list)
+        cannot_escape = is_trapped or not has_alive_bench
+
+        if pokemon.perish_turns > 0:
+            if cannot_escape:
+                if pokemon.perish_turns == 1:
+                    penalty += self.weight_alive_differential * 0.80
+                elif pokemon.perish_turns == 2:
+                    penalty += self.weight_alive_differential * 0.55
+                else:
+                    penalty += self.weight_alive_differential * 0.35
+            else:
+                if pokemon.perish_turns == 1:
+                    penalty += self.weight_alive_differential * 0.45
+                elif pokemon.perish_turns == 2:
+                    penalty += self.weight_alive_differential * 0.20
+                else:
+                    penalty += self.weight_alive_differential * 0.10
+
+        if is_trapped and has_alive_bench:
+            opp_active = state.opponent_active_pokemon if pokemon.side == 1 else state.active_pokemon
+            opp_has_perish = any(
+                opp is not None and not opp.fainted and "perishsong" in opp.moves
+                for opp in opp_active
+            )
+            penalty += 300.0 if opp_has_perish else 125.0
+
+        return penalty
     
+_NUMERIC_SWAP_INDICES: Optional[torch.Tensor] = None
+_SLOT_SWAP_INDICES = [2, 3, 0, 1, 6, 7, 4, 5]
+
+
+def get_numeric_swap_indices(device: torch.device | str = "cpu") -> torch.Tensor:
+    """Returns the 1187-element index permutation that swaps Side 1 and Side 2 in numeric observations."""
+    global _NUMERIC_SWAP_INDICES
+    if _NUMERIC_SWAP_INDICES is None:
+        idx = list(range(10))                      # [0:10] weather (5) + terrain (5)
+        idx += [13, 14, 15, 10, 11, 12]            # [10:16] swap own screens <-> opp screens
+        idx += [16, 18, 17]                        # [16:19] trick room + swap own tailwind <-> opp tailwind
+        idx += list(range(311, 603))               # [19:311] <- opp_active_pokemon [311:603]
+        idx += list(range(19, 311))                # [311:603] <- own_active_pokemon [19:311]
+        idx += list(range(895, 1187))              # [603:895] <- opp_bench [895:1187]
+        idx += list(range(603, 895))               # [895:1187] <- own_bench [603:895]
+        _NUMERIC_SWAP_INDICES = torch.tensor(idx, dtype=torch.long)
+    return _NUMERIC_SWAP_INDICES.to(device)
+
+
+def swap_tensor_observations(tensor_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    Swaps Side 1 and Side 2 perspectives in a batched observation tensor dict
+    ({"numeric": (B, 1187), "abilities": (B, 8, 215), "items": (B, 8, 167)}).
+    """
+    num_tensor = tensor_obs["numeric"]
+    swap_idx = get_numeric_swap_indices(num_tensor.device)
+    return {
+        "numeric": num_tensor.index_select(-1, swap_idx),
+        "abilities": tensor_obs["abilities"][..., _SLOT_SWAP_INDICES, :],
+        "items": tensor_obs["items"][..., _SLOT_SWAP_INDICES, :],
+    }
+
+
 class NeuralValueEvaluator(BattleStateEvaluator):
     """
     Evaluator that queries the trained neural network value head (critic) from Stable-Baselines3
     or a PyTorch actor-critic network to evaluate leaf board states.
+    Enforces zero-sum side anti-symmetry: V_sym(S) = 0.5 * (V(S) - V(swap(S))).
     """
-
-    def __init__(self, model: Any, state_encoder: Optional[StateEncoder] = None, device: str = "cpu"):
+    def __init__(self, model: Any, state_encoder: Optional[StateEncoder] = None, symmetric: bool = True):
         self.model = model
-        self.device = device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.state_encoder = state_encoder if state_encoder is not None else StateEncoder()
+        self.symmetric = symmetric
 
-    def evaluate(self, state: SimulatedBattleState) -> float:
+    def evaluate_batch(self, states: List[SimulatedBattleState]) -> torch.Tensor:
         """
-        Extracts observations and queries the critic value function: V_theta(s).
-        Returns the neural network value scaled to match heuristic ranges.
+        Batches multiple simulated states into a single tensor dict and queries the critic.
+        Returns a 1D tensor of values: shape (batch_size,).
         """
-        if self.model is None or self.state_encoder is None:
-            return 0.0
-
-        # Check if model has a policy with predict_values (standard in Stable-Baselines3 MaskablePPO)
+        if self.model is None or self.state_encoder is None or not states:
+            return torch.zeros(len(states), device=self.device)
+        
         if hasattr(self.model, "policy") and hasattr(self.model.policy, "predict_values"):
-            # If we have an active battle attached, encode it
-            raw_battle = getattr(state, "_raw_battle_reference", None)
-            if raw_battle is not None:
-                encoded_observation = self.state_encoder.encode(raw_battle)
-                tensor_observation, _ = self.model.policy.obs_to_tensor(encoded_observation)
-                with torch.no_grad():
-                    value_tensor = self.model.policy.predict_values(tensor_observation)
-                    return float(value_tensor.cpu().numpy().item()) * 5000.0
-        return 0.0
+            encoded_list = [self.state_encoder.encode(s) for s in states]
+            # Batch the numpy arrays along axis 0 for each key
+            batched_np = {
+                key: np.stack([obs[key] for obs in encoded_list], axis=0)
+                for key in encoded_list[0].keys()
+            }
+            tensor_obs, _ = self.model.policy.obs_to_tensor(batched_np)
+            with torch.no_grad():
+                if self.symmetric:
+                    swapped_obs = swap_tensor_observations(tensor_obs)
+                    combined_obs = {
+                        k: torch.cat([tensor_obs[k], swapped_obs[k]], dim=0)
+                        for k in tensor_obs
+                    }
+                    combined_values = self.model.policy.predict_values(combined_obs).view(-1)
+                    batch_len = len(states)
+                    v_forward = combined_values[:batch_len]
+                    v_swapped = combined_values[batch_len:]
+                    value_tensor = 0.5 * (v_forward - v_swapped)
+                else:
+                    value_tensor = self.model.policy.predict_values(tensor_obs).view(-1)
+                return torch.clamp(value_tensor, -1.0, 1.0)
+        return torch.zeros(len(states), device=self.device)
+    
+    def evaluate(self, state: SimulatedBattleState | List[SimulatedBattleState]) -> torch.Tensor:
+        """
+        Evaluates a single state or a batch of states.
+        """
+        if isinstance(state, list):
+            return self.evaluate_batch(state)
+        return self.evaluate_batch([state])[0]
 
 class HybridEvaluator(BattleStateEvaluator):
     """
     Blends the handcrafted competitive heuristic with an optional trained neural network value head.
     """
-
     def __init__(
         self,
+        model: Any,
         heuristic_evaluator: Optional[CompetitiveHeuristicEvaluator] = None,
         neural_evaluator: Optional[NeuralValueEvaluator] = None,
         neural_weight: float = 0.35
     ):
         self.heuristic_evaluator = heuristic_evaluator or CompetitiveHeuristicEvaluator()
-        self.neural_evaluator = neural_evaluator
-        self.neural_weight = neural_weight if neural_evaluator else 0.0
+        self.neural_evaluator = neural_evaluator or (NeuralValueEvaluator(model=model) if model is not None else None)
+        self.neural_weight = neural_weight if self.neural_evaluator else 0.0
 
-    def evaluate(self, state: SimulatedBattleState) -> float:
-        heuristic_score = self.heuristic_evaluator.evaluate(state)
+    def evaluate_batch(self, states: List[SimulatedBattleState]) -> torch.Tensor:
+        heuristic_scores = self.heuristic_evaluator.evaluate(states)
+        heuristic_normalized = torch.tanh(heuristic_scores / 8000.0)
         if self.neural_evaluator and self.neural_weight > 0.0:
-            neural_score = self.neural_evaluator.evaluate(state)
-            return (1.0 - self.neural_weight) * heuristic_score + (self.neural_weight * neural_score)
-        return heuristic_score
+            neural_scores = self.neural_evaluator.evaluate(states).to(heuristic_normalized.device)
+            return (1.0 - self.neural_weight) * heuristic_normalized + (self.neural_weight * neural_scores)
+        return heuristic_normalized
+
+    def evaluate(self, state: SimulatedBattleState | List[SimulatedBattleState]) -> torch.Tensor:
+        if isinstance(state, list):
+            return self.evaluate_batch(state)
+        return self.evaluate_batch([state])[0]

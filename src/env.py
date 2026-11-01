@@ -10,8 +10,10 @@ import queue
 import asyncio
 
 from src.state_encoder import StateEncoder
+from src.simulation import SimulatedBattleState
 from src.players import RLPlayer
 from src.team_pool import TeamPool
+from src.constants import _SOUND_MOVES
 
 # ----------------- Action and Order Helper Functions -----------------
 
@@ -84,17 +86,29 @@ def get_slot_action_mask(battle: pkmn_b.DoubleBattle, slot_idx: int) -> list[boo
     
     moves = list(pokemon.moves.values())
     available_moves = battle.available_moves[slot_idx]
+    choice_items = ["choiceband", "choicescarf", "choicespecs"]
     
     for action in range(12):
         move_index = action // 3
         target_index = action % 3
-        if move_index < len(moves) and moves[move_index] in available_moves and valid_targets[target_index]:
-            mask[action] = True
-            if battle.can_mega_evolve[slot_idx]:
-                mask[action + 12] = True
-        if move_index < len(moves) and moves[move_index].id == "fakeout" and not pokemon.first_turn:
-            mask[action] = False
-            mask[action + 12] = False
+        if move_index < len(moves):
+            if moves[move_index] in available_moves and valid_targets[target_index]:
+                mask[action] = True
+                if battle.can_mega_evolve[slot_idx]:
+                    mask[action + 12] = True
+            if moves[move_index].id == "fakeout" and not pokemon.first_turn:
+                mask[action] = False
+                mask[action + 12] = False
+            if (pokemon.item in choice_items or pkmn_b.Effect.ENCORE in pokemon.effects) and pokemon.last_move is not None and moves[move_index] != pokemon.last_move:
+                if not pokemon.first_turn:
+                    mask[action] = False
+                    mask[action + 12] = False
+            if (pokemon.item == "assaultvest" or pkmn_b.Effect.TAUNT in pokemon.effects) and moves[move_index].category == pkmn_b.MoveCategory.STATUS:
+                mask[action] = False
+                mask[action + 12] = False
+            if pkmn_b.Effect.THROAT_CHOP in pokemon.effects and moves[move_index].id in _SOUND_MOVES:
+                mask[action] = False
+                mask[action + 12] = False
     
     bench = [
         pokemon for pokemon in battle.team.values() 
@@ -224,7 +238,7 @@ class VGCEnv(gym.Env):
         self.opponent = opponent if opponent is not None else RandomPlayer(battle_format=self.battle_format)
         self.state_encoder = StateEncoder()
         self.observation_space = spaces.Dict({
-            "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1149,), dtype=np.float32),
+            "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1187,), dtype=np.float32),
             "abilities": spaces.Box(low=0.0, high=1.0, shape=(8, 215), dtype=np.float32),
             "items": spaces.Box(low=0.0, high=1.0, shape=(8, 167), dtype=np.float32),
         })
@@ -335,10 +349,17 @@ class VGCEnv(gym.Env):
         ]
         self.num_opponent_alive = len(opp_mons)
         self.num_self_alive = len(self_mons)
-        state = self.state_encoder.encode(self.current_battle)
+        state = self._get_obs()
         self.opp_hp = sum(p.current_hp_fraction for p in opp_mons) if opp_mons else 0.0
         self.self_hp = sum(p.current_hp_fraction for p in self_mons) if self_mons else 0.0
         return state, {}
+
+    def _get_obs(self) -> dict[str, np.ndarray]:
+        """
+        Encode the current battle state after completing unrevealed opponent priors via SimulatedBattleState.
+        """
+        sim_state = SimulatedBattleState.from_battle(self.current_battle, fill_unrevealed=True)
+        return self.state_encoder.encode(sim_state)
     
     def step(self, action: int) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         """
@@ -353,7 +374,7 @@ class VGCEnv(gym.Env):
         if self.current_battle.turn >= 30:
             self.agent.receive_order(ForfeitBattleOrder())
             self.current_battle = self.agent.battle_queue.get()
-            state = self.state_encoder.encode(self.current_battle)
+            state = self._get_obs()
             return state, -1.0, True, True, {}
         
         action_a = action // 26
@@ -374,12 +395,12 @@ class VGCEnv(gym.Env):
                 self.current_battle = self.agent.battle_queue.get(timeout=5.0)
             except queue.Empty:
                 pass
-            state = self.state_encoder.encode(self.current_battle)
+            state = self._get_obs()
             return state, -1.0, True, True, {}
 
         reward = self.calculate_reward(self.current_battle)
         done = self.current_battle.finished
-        state = self.state_encoder.encode(self.current_battle)
+        state = self._get_obs()
         return state, reward, done, False, {}
     
     def calculate_reward(self, battle: pkmn_b.DoubleBattle) -> float:

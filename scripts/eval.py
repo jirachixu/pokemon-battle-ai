@@ -17,6 +17,7 @@ from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.player import SimpleHeuristicsPlayer, RandomPlayer, Player
 
 from src.env import VGCEnv
+from src.evaluator import HybridEvaluator
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch
 from src.models import TeamPreviewModel
@@ -29,7 +30,7 @@ def evaluate_neural_lookahead(
     team_path: str = "teams/MC646.txt",
     n_eval_episodes: int = 50,
     search_depth: int = 2,
-    search_candidates: int = 8,
+    search_candidates: int = 9,
     opponent_type: str = "simple_heuristics",
     sample_teams: bool = True,
 ) -> tuple[float, float, float]:
@@ -55,7 +56,7 @@ def evaluate_neural_lookahead(
             battle_format="gen9championsvgc2026regmc",
             team=team_paste,
             depth=2,
-            max_candidates=8,
+            max_candidates=9,
             accept_open_team_sheet=True,
             account_configuration=AccountConfiguration(f"Lookahead_{uuid.uuid4().hex[:6]}", None),
             team_preview_model=preview_model,
@@ -95,6 +96,8 @@ def evaluate_neural_lookahead(
     searcher = LookaheadSearch(
         depth=search_depth,
         max_candidates=search_candidates,
+        model=model,
+        evaluator=HybridEvaluator(model=model, neural_weight=1.0),
     )
 
     print(f"\n=======================================================")
@@ -267,7 +270,7 @@ def main():
     )
     parser.add_argument("--episodes", type=int, default=100, help="Number of evaluation episodes")
     parser.add_argument("--depth", type=int, default=2, help="Lookahead search depth")
-    parser.add_argument("--candidates", type=int, default=8, help="Candidate pool limit per slot")
+    parser.add_argument("--candidates", type=int, default=9, help="Candidate pool limit per slot")
     parser.add_argument(
         "--opponent",
         type=str,

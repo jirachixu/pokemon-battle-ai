@@ -1,7 +1,14 @@
 import math
-from typing import Optional, Tuple
+from enum import Enum
+from typing import Optional, Tuple, Union
 import poke_env.battle as pkmn_b
 import src.constants as constants
+from src.simulation import SimulatedBattleState, SimulatedPokemon, SimulatedMove
+
+BattleType = Union[pkmn_b.DoubleBattle, SimulatedBattleState]
+PokemonType_ = Union[pkmn_b.Pokemon, SimulatedPokemon]
+MoveType = Union[pkmn_b.Move, SimulatedMove]
+PokemonTypeEnumOrStr = Union[pkmn_b.PokemonType, str]
 
 _hook_installed = False
 
@@ -31,22 +38,45 @@ def init_battle_damage_tracking() -> None:
 
 init_battle_damage_tracking()
 
-def clean_str(val: Optional[str]) -> str:
-    """Normalize strings for robust comparison."""
+def clean_str(val: Optional[Union[str, Enum]]) -> str:
+    """Normalize strings or enums for robust comparison."""
     if not val:
         return ""
+    if isinstance(val, Enum):
+        val = val.name
     return str(val).lower().replace(" ", "").replace("-", "").replace("_", "")
 
-def is_grounded(pokemon: Optional[pkmn_b.Pokemon], battle: pkmn_b.DoubleBattle) -> bool:
+
+def _has_field(battle: BattleType, field_name: str) -> bool:
+    fields = getattr(battle, "fields", {})
+    if not fields:
+        return False
+    for f in fields:
+        if clean_str(f) == field_name:
+            return True
+    return False
+
+def _has_weather(battle: BattleType, weather_names: tuple[str, ...]) -> bool:
+    weather = getattr(battle, "weather", {})
+    if not weather:
+        return False
+    for w in weather:
+        if clean_str(w) in weather_names:
+            return True
+    return False
+
+def is_grounded(pokemon: Optional[PokemonType_], battle: BattleType) -> bool:
     """Checks if a Pokémon is grounded."""
     if pokemon is None:
         return True
-    if pkmn_b.Field.GRAVITY in battle.fields:
+    if _has_field(battle, "gravity"):
         return True
     if clean_str(getattr(pokemon, "item", None)) == "ironball":
         return True
-    if pkmn_b.PokemonType.FLYING in getattr(pokemon, "types", ()):
-        return False
+    types = getattr(pokemon, "types", ())
+    for t in types:
+        if clean_str(t) == "flying":
+            return False
     ability = clean_str(getattr(pokemon, "ability", None))
     if ability in ("levitate", "eelevate"):
         return False
@@ -55,51 +85,79 @@ def is_grounded(pokemon: Optional[pkmn_b.Pokemon], battle: pkmn_b.DoubleBattle) 
     return True
 
 def get_move_type_and_bp_boost(
-    move: pkmn_b.Move,
-    attacker: pkmn_b.Pokemon
-) -> Tuple[pkmn_b.PokemonType, float]:
-    """Resolves moves whose type is modified by abilities."""
+    move: MoveType,
+    attacker: PokemonType_,
+    battle: Optional[BattleType] = None
+) -> Tuple[PokemonTypeEnumOrStr, float]:
+    """Resolves moves whose type is modified by abilities, weather, or terrain."""
     ability = clean_str(getattr(attacker, "ability", None))
-    move_type = move.type
+    move_type = getattr(move, "type", "normal")
+    move_id = clean_str(getattr(move, "id", ""))
+    c_move_type = clean_str(move_type)
     bp_boost = 1.0
 
-    if move_type == pkmn_b.PokemonType.NORMAL:
+    is_enum = isinstance(move_type, pkmn_b.PokemonType)
+
+    if battle is not None:
+        if move_id == "weatherball":
+            if _has_weather(battle, ("sunnyday", "sun", "desolateland")) or ability == "megasol":
+                return (pkmn_b.PokemonType.FIRE if is_enum else "fire"), 1.0
+            elif _has_weather(battle, ("raindance", "rain", "primordialsea")):
+                return (pkmn_b.PokemonType.WATER if is_enum else "water"), 1.0
+            elif _has_weather(battle, ("sandstorm", "sand")):
+                return (pkmn_b.PokemonType.ROCK if is_enum else "rock"), 1.0
+            elif _has_weather(battle, ("snowscape", "snow", "hail")):
+                return (pkmn_b.PokemonType.ICE if is_enum else "ice"), 1.0
+        elif move_id == "terrainpulse" and is_grounded(attacker, battle):
+            if _has_field(battle, "electricterrain"):
+                return (pkmn_b.PokemonType.ELECTRIC if is_enum else "electric"), 1.0
+            elif _has_field(battle, "grassyterrain"):
+                return (pkmn_b.PokemonType.GRASS if is_enum else "grass"), 1.0
+            elif _has_field(battle, "psychicterrain"):
+                return (pkmn_b.PokemonType.PSYCHIC if is_enum else "psychic"), 1.0
+            elif _has_field(battle, "mistyterrain"):
+                return (pkmn_b.PokemonType.FAIRY if is_enum else "fairy"), 1.0
+
+    if c_move_type == "normal":
         if ability == "dragonize":
-            return pkmn_b.PokemonType.DRAGON, 1.2
+            return (pkmn_b.PokemonType.DRAGON if is_enum else "dragon"), 1.2
         elif ability == "pixilate":
-            return pkmn_b.PokemonType.FAIRY, 1.2
+            return (pkmn_b.PokemonType.FAIRY if is_enum else "fairy"), 1.2
         elif ability == "aerilate":
-            return pkmn_b.PokemonType.FLYING, 1.2
+            return (pkmn_b.PokemonType.FLYING if is_enum else "flying"), 1.2
         elif ability == "refrigerate":
-            return pkmn_b.PokemonType.ICE, 1.2
+            return (pkmn_b.PokemonType.ICE if is_enum else "ice"), 1.2
         elif ability == "galvanize":
-            return pkmn_b.PokemonType.ELECTRIC, 1.2
+            return (pkmn_b.PokemonType.ELECTRIC if is_enum else "electric"), 1.2
 
     if ability == "liquidvoice" and "sound" in getattr(move, "flags", set()):
-        return pkmn_b.PokemonType.WATER, 1.0
+        return (pkmn_b.PokemonType.WATER if is_enum else "water"), 1.0
 
     return move_type, bp_boost
 
+
+
+
 def get_dynamic_base_power(
-    move: pkmn_b.Move,
-    attacker: pkmn_b.Pokemon,
-    target: Optional[pkmn_b.Pokemon],
-    battle: pkmn_b.DoubleBattle
+    move: MoveType,
+    attacker: PokemonType_,
+    target: Optional[PokemonType_],
+    battle: BattleType
 ) -> float:
     """
     Calculates exact dynamic base power for variable-power moves in Gen 9 VGC & Champions.
     Works for both user Pokémon and opponent revealed moves.
     """
-    move_id = move.id
-    raw_bp = float(move.base_power)
+    move_id = clean_str(getattr(move, "id", ""))
+    raw_bp = float(getattr(move, "base_power", 0.0))
 
     # Attacker Current HP Scaling
     if move_id in ("waterspout", "eruption", "dragonenergy"):
-        hp_frac = attacker.current_hp_fraction if attacker.current_hp_fraction is not None else 1.0
+        hp_frac = attacker.current_hp_fraction if getattr(attacker, "current_hp_fraction", None) is not None else 1.0
         return max(1.0, math.floor(150.0 * hp_frac))
 
     if move_id in ("flail", "reversal"):
-        hp_frac = attacker.current_hp_fraction if attacker.current_hp_fraction is not None else 1.0
+        hp_frac = attacker.current_hp_fraction if getattr(attacker, "current_hp_fraction", None) is not None else 1.0
         if hp_frac <= 0.0417: return 200.0
         if hp_frac <= 0.1042: return 150.0
         if hp_frac <= 0.2083: return 100.0
@@ -109,33 +167,42 @@ def get_dynamic_base_power(
 
     # Target Current HP Scaling
     if move_id == "hardpress":
-        if target is None or target.current_hp_fraction is None: return 100.0
+        if target is None or getattr(target, "current_hp_fraction", None) is None: return 100.0
         return max(1.0, math.floor(100.0 * target.current_hp_fraction))
 
     if move_id == "crushgrip":
-        if target is None or target.current_hp_fraction is None: return 120.0
+        if target is None or getattr(target, "current_hp_fraction", None) is None: return 120.0
         return max(1.0, math.floor(120.0 * target.current_hp_fraction))
 
     if move_id == "brine":
-        if target and target.current_hp_fraction is not None and target.current_hp_fraction <= 0.5:
+        if target and getattr(target, "current_hp_fraction", None) is not None and target.current_hp_fraction <= 0.5:
             return 130.0
         return 65.0
 
     if move_id == "lastrespects":
-        is_self = attacker in battle.team.values()
-        team = battle.team.values() if is_self else battle.opponent_team.values()
-        fainted_allies = sum(1 for p in team if p and p.fainted)
+        if isinstance(battle, pkmn_b.DoubleBattle):
+            is_self = attacker in battle.team.values()
+            team_mons = list(battle.team.values() if is_self else battle.opponent_team.values())
+            fainted_allies = sum(1 for p in team_mons if p and p.fainted)
+        else:
+            is_self = attacker.side == 1 if isinstance(attacker, SimulatedPokemon) else True
+            sim_team = battle.all_team_pokemon() if is_self else battle.all_opponent_pokemon()
+            fainted_allies = sum(1 for p in sim_team if p and p.fainted)
         return 50.0 + (50.0 * fainted_allies)
+
 
     if move_id == "ragefist":
         hits = 0
-        if hasattr(battle, "_hit_counts"):
-            attacker_species = clean_str(attacker.species)
-            attacker_name = clean_str(attacker.name)
-            hit_counts = getattr(battle, "_hit_counts", {})
+        hit_counts = getattr(battle, "_hit_counts", None) or getattr(battle, "hit_counts", {})
+        if hit_counts:
+            attacker_species = clean_str(getattr(attacker, "species", ""))
+            attacker_name = clean_str(getattr(attacker, "name", ""))
             for ident, count in hit_counts.items():
                 c_ident = clean_str(ident)
-                if attacker_species in c_ident or attacker_name in c_ident:
+                if attacker_species and attacker_species in c_ident:
+                    hits = count
+                    break
+                if attacker_name and attacker_name in c_ident:
                     hits = count
                     break
         return min(350.0, 50.0 + (50.0 * hits))
@@ -167,110 +234,118 @@ def get_dynamic_base_power(
 
     # Status Condition Scaling
     if move_id == "facade":
-        if attacker.status in (pkmn_b.Status.BRN, pkmn_b.Status.PAR, pkmn_b.Status.PSN, pkmn_b.Status.TOX):
+        c_status = clean_str(getattr(attacker, "status", None))
+        if c_status in ("brn", "par", "psn", "tox", "burn", "paralysis", "poison", "toxic"):
             return 140.0
         return 70.0
 
     if move_id in ("hex", "infernalparade"):
         base = 60.0 if move_id == "infernalparade" else 65.0
-        return (base * 2.0) if (target and target.status is not None) else base
+        return (base * 2.0) if (target and getattr(target, "status", None) is not None) else base
 
     if move_id in ("venoshock", "barbbarrage"):
         base = 60.0 if move_id == "barbbarrage" else 65.0
-        return (base * 2.0) if (target and target.status in (pkmn_b.Status.PSN, pkmn_b.Status.TOX)) else base
+        tgt_status = clean_str(getattr(target, "status", None)) if target else ""
+        return (base * 2.0) if (tgt_status in ("psn", "tox", "poison", "toxic")) else base
 
     # Item Interactions
     if move_id == "knockoff":
-        if target is not None and getattr(target, "item", None) not in (None, "none", "unknown_item"):
+        if target is not None and clean_str(getattr(target, "item", None)) not in ("", "none", "unknownitem"):
             if not str(target.item).endswith("ite"):  # Mega stones cannot be knocked off
                 return 97.5
         return 65.0
 
     if move_id == "acrobatics":
-        if getattr(attacker, "item", None) in (None, "none"):
+        if clean_str(getattr(attacker, "item", None)) in ("", "none"):
             return 110.0
         return 55.0
 
     # Terrain & Weather Field Attacks
     if move_id == "expandingforce":
-        if pkmn_b.Field.PSYCHIC_TERRAIN in battle.fields and is_grounded(attacker, battle):
+        if _has_field(battle, "psychicterrain") and is_grounded(attacker, battle):
             return 120.0
         return 80.0
 
     if move_id == "risingvoltage":
-        if pkmn_b.Field.ELECTRIC_TERRAIN in battle.fields and target and is_grounded(target, battle):
+        if _has_field(battle, "electricterrain") and target and is_grounded(target, battle):
             return 140.0
         return 70.0
 
     if move_id == "psyblade":
-        if pkmn_b.Field.ELECTRIC_TERRAIN in battle.fields and is_grounded(attacker, battle):
+        if _has_field(battle, "electricterrain"):
             return 120.0
         return 80.0
 
     if move_id == "mistyexplosion":
-        if pkmn_b.Field.MISTY_TERRAIN in battle.fields and is_grounded(attacker, battle):
+        if _has_field(battle, "mistyterrain") and is_grounded(attacker, battle):
             return 150.0
         return 100.0
 
     if move_id == "weatherball":
         active_weather = (
-            pkmn_b.Weather.SUNNYDAY in battle.weather or pkmn_b.Weather.DESOLATELAND in battle.weather or
-            pkmn_b.Weather.RAINDANCE in battle.weather or pkmn_b.Weather.PRIMORDIALSEA in battle.weather or
-            pkmn_b.Weather.SANDSTORM in battle.weather or pkmn_b.Weather.SNOWSCAPE in battle.weather or
-            pkmn_b.Weather.HAIL in battle.weather
+            _has_weather(
+                battle,
+                ("sunnyday", "sun", "desolateland", "raindance", "rain", "primordialsea", "sandstorm", "sand", "snowscape", "snow", "hail")
+            )
+            or clean_str(getattr(attacker, "ability", None)) == "megasol"
         )
         return 100.0 if active_weather else 50.0
 
     if move_id == "terrainpulse":
         active_terrain = (
-            pkmn_b.Field.ELECTRIC_TERRAIN in battle.fields or
-            pkmn_b.Field.GRASSY_TERRAIN in battle.fields or
-            pkmn_b.Field.MISTY_TERRAIN in battle.fields or
-            pkmn_b.Field.PSYCHIC_TERRAIN in battle.fields
+            _has_field(battle, "electricterrain") or
+            _has_field(battle, "grassyterrain") or
+            _has_field(battle, "mistyterrain") or
+            _has_field(battle, "psychicterrain")
         )
         return 100.0 if (active_terrain and is_grounded(attacker, battle)) else 50.0
 
     # Stat Boost Accumulation
     if move_id in ("storedpower", "powertrip"):
-        pos_boosts = sum(max(0, val) for val in attacker.boosts.values())
+        pos_boosts = sum(max(0, val) for val in getattr(attacker, "boosts", {}).values())
         return 20.0 + (20.0 * pos_boosts)
 
     return raw_bp
 
 def get_spread_multiplier(
-    move: pkmn_b.Move,
-    attacker: pkmn_b.Pokemon,
-    target_1: Optional[pkmn_b.Pokemon],
-    target_2: Optional[pkmn_b.Pokemon],
-    battle: pkmn_b.DoubleBattle
+    move: MoveType,
+    attacker: PokemonType_,
+    target_1: Optional[PokemonType_],
+    target_2: Optional[PokemonType_],
+    battle: BattleType
 ) -> float:
     """Calculates the damage multiplier for spread moves."""
-    if move.category == pkmn_b.MoveCategory.STATUS:
+    c_category = clean_str(getattr(move, "category", ""))
+    if c_category == "status":
         return 1.0
 
     is_spread = False
-    if move.target in (pkmn_b.Target.ALL_ADJACENT_FOES, pkmn_b.Target.ALL_ADJACENT):
+    target_val = clean_str(getattr(move, "target", ""))
+    if target_val in ("alladjacentfoes", "alladjacent"):
         is_spread = True
-    elif move.id == "expandingforce" and pkmn_b.Field.PSYCHIC_TERRAIN in battle.fields and is_grounded(attacker, battle):
+    elif getattr(move, "is_spread", False):
+        is_spread = True
+    elif clean_str(getattr(move, "id", "")) == "expandingforce" and _has_field(battle, "psychicterrain") and is_grounded(attacker, battle):
         is_spread = True
 
     if not is_spread:
         return 1.0
 
     alive_targets = 0
-    if target_1 is not None and not target_1.fainted:
+    if target_1 is not None and not getattr(target_1, "fainted", False):
         alive_targets += 1
-    if target_2 is not None and not target_2.fainted:
+    if target_2 is not None and not getattr(target_2, "fainted", False):
         alive_targets += 1
 
     return 0.75 if alive_targets >= 2 else 1.0
 
+
 def get_attacker_ability_multiplier(
-    move: pkmn_b.Move,
+    move: MoveType,
     raw_base_power: float,
-    effective_move_type: pkmn_b.PokemonType,
-    attacker: pkmn_b.Pokemon,
-    battle: pkmn_b.DoubleBattle
+    effective_move_type: PokemonTypeEnumOrStr,
+    attacker: PokemonType_,
+    battle: BattleType
 ) -> float:
     """Calculates offensive ability modifiers."""
     ability = clean_str(getattr(attacker, "ability", None))
@@ -296,97 +371,117 @@ def get_attacker_ability_multiplier(
         mult *= 1.5
     elif ability == "sheerforce" and bool(getattr(move, "secondary", None)):
         mult *= 1.3
-    elif ability == "reckless" and getattr(move, "recoil", 0.0) > 0.0:
+    elif ability == "reckless" and (getattr(move, "recoil", 0.0) > 0.0 or getattr(move, "has_crash_damage", False)):
         mult *= 1.2
     elif ability == "parentalbond":
         mult *= 1.25
 
-    if ability == "firemane" and effective_move_type == pkmn_b.PokemonType.FIRE:
+    c_move_type = clean_str(effective_move_type)
+    if ability == "firemane" and c_move_type == "fire":
         mult *= 1.5
-    elif ability == "transistor" and effective_move_type == pkmn_b.PokemonType.ELECTRIC:
+    elif ability == "transistor" and c_move_type == "electric":
         mult *= 1.3
-    elif ability == "dragonsmaw" and effective_move_type == pkmn_b.PokemonType.DRAGON:
+    elif ability == "dragonsmaw" and c_move_type == "dragon":
         mult *= 1.5
-    elif ability in ("steelworker", "steelyspirit") and effective_move_type == pkmn_b.PokemonType.STEEL:
+    elif ability in ("steelworker", "steelyspirit") and c_move_type == "steel":
         mult *= 1.5
-    elif ability == "rockypayload" and effective_move_type == pkmn_b.PokemonType.ROCK:
+    elif ability == "rockypayload" and c_move_type == "rock":
         mult *= 1.5
-    elif ability == "waterbubble" and effective_move_type == pkmn_b.PokemonType.WATER:
+    elif ability == "waterbubble" and c_move_type == "water":
         mult *= 2.0
+    elif ability == "sandforce" and _has_weather(battle, ("sandstorm", "sand")) and c_move_type in ("rock", "ground", "steel"):
+        mult *= 1.3
 
-    is_physical = (move.category == pkmn_b.MoveCategory.PHYSICAL)
-    is_special = (move.category == pkmn_b.MoveCategory.SPECIAL)
+    c_category = clean_str(getattr(move, "category", ""))
+    is_physical = (c_category == "physical")
+    is_special = (c_category == "special")
 
+    c_status = clean_str(getattr(attacker, "status", None))
     if ability in ("hugepower", "purepower") and is_physical:
         mult *= 2.0
     elif ability == "gorillatactics" and is_physical:
         mult *= 1.5
-    elif ability == "guts" and is_physical and attacker.status is not None:
+    elif ability == "guts" and is_physical and bool(c_status):
         mult *= 1.5
-    elif ability == "toxicboost" and is_physical and attacker.status in (pkmn_b.Status.PSN, pkmn_b.Status.TOX):
+    elif ability == "toxicboost" and is_physical and c_status in ("psn", "tox", "poison", "toxic"):
         mult *= 1.5
-    elif ability == "flareboost" and is_special and attacker.status == pkmn_b.Status.BRN:
+    elif ability == "flareboost" and is_special and c_status in ("brn", "burn"):
         mult *= 1.5
     elif ability == "supremeoverlord":
-        is_self = attacker in battle.team.values()
-        team = battle.team.values() if is_self else battle.opponent_team.values()
-        fainted_count = sum(1 for p in team if p and p.fainted)
+        if isinstance(battle, pkmn_b.DoubleBattle):
+            is_self = attacker in battle.team.values()
+            team_mons = list(battle.team.values() if is_self else battle.opponent_team.values())
+            fainted_count = sum(1 for p in team_mons if p and p.fainted)
+        else:
+            is_self = attacker.side == 1 if isinstance(attacker, SimulatedPokemon) else True
+            sim_team = battle.all_team_pokemon() if is_self else battle.all_opponent_pokemon()
+            fainted_count = sum(1 for p in sim_team if p and p.fainted)
         mult *= (1.0 + (0.10 * fainted_count))
 
+
     is_sun = (
-        pkmn_b.Weather.SUNNYDAY in battle.weather or
-        pkmn_b.Weather.DESOLATELAND in battle.weather or
+        _has_weather(battle, ("sunnyday", "sun", "desolateland")) or
         ability == "megasol"
     )
-    if ability == "hadronengine" and is_special and pkmn_b.Field.ELECTRIC_TERRAIN in battle.fields:
+    if ability == "hadronengine" and is_special and _has_field(battle, "electricterrain"):
         mult *= 1.33
     elif ability == "orichalcumpulse" and is_physical and is_sun:
         mult *= 1.33
     elif ability == "solarpower" and is_special and is_sun:
         mult *= 1.5
 
-    hp_frac = attacker.current_hp_fraction if attacker.current_hp_fraction is not None else 1.0
+    hp_frac = attacker.current_hp_fraction if getattr(attacker, "current_hp_fraction", None) is not None else 1.0
     if hp_frac <= 0.33:
-        if ability == "blaze" and effective_move_type == pkmn_b.PokemonType.FIRE:
+        if ability == "blaze" and c_move_type == "fire":
             mult *= 1.5
-        elif ability == "torrent" and effective_move_type == pkmn_b.PokemonType.WATER:
+        elif ability == "torrent" and c_move_type == "water":
             mult *= 1.5
-        elif ability == "overgrow" and effective_move_type == pkmn_b.PokemonType.GRASS:
+        elif ability == "overgrow" and c_move_type == "grass":
             mult *= 1.5
-        elif ability == "swarm" and effective_move_type == pkmn_b.PokemonType.BUG:
+        elif ability == "swarm" and c_move_type == "bug":
             mult *= 1.5
 
     return mult
 
 def get_target_defense_multiplier(
-    move: pkmn_b.Move,
-    effective_move_type: pkmn_b.PokemonType,
-    attacker: pkmn_b.Pokemon,
-    target: Optional[pkmn_b.Pokemon],
-    battle: pkmn_b.DoubleBattle,
+    move: MoveType,
+    effective_move_type: PokemonTypeEnumOrStr,
+    attacker: PokemonType_,
+    target: Optional[PokemonType_],
+    battle: BattleType,
     raw_type_multiplier: float
 ) -> float:
     """Handles target immunities and defensive reductions."""
     if target is None:
         return 1.0
 
-    ability = clean_str(getattr(target, "ability", None))
+    raw_ability = clean_str(getattr(target, "ability", None))
     attacker_ability = clean_str(getattr(attacker, "ability", None))
+    ignores_ability = attacker_ability in ("moldbreaker", "teravolt", "turboblaze")
+    ability = (
+        raw_ability
+        if (not ignores_ability or raw_ability in ("fullmetalbody", "shadowshield", "prismarmor", "comatose"))
+        else ""
+    )
     flags = getattr(move, "flags", set())
+    c_move_type = clean_str(effective_move_type)
+    c_category = clean_str(getattr(move, "category", ""))
 
-    if effective_move_type == pkmn_b.PokemonType.GROUND:
-        if ability in ("levitate", "eelevate", "eartheater") and not is_grounded(target, battle):
+    if c_move_type == "ground":
+        if ability == "eartheater":
             return 0.0
-    elif effective_move_type == pkmn_b.PokemonType.FIRE:
+        if ability in ("levitate", "eelevate") and not is_grounded(target, battle):
+            return 0.0
+    elif c_move_type == "fire":
         if ability in ("flashfire", "wellbakedbody"):
             return 0.0
-    elif effective_move_type == pkmn_b.PokemonType.WATER:
+    elif c_move_type == "water":
         if ability in ("waterabsorb", "stormdrain", "dryskin"):
             return 0.0
-    elif effective_move_type == pkmn_b.PokemonType.ELECTRIC:
+    elif c_move_type == "electric":
         if ability in ("voltabsorb", "lightningrod", "motordrive"):
             return 0.0
-    elif effective_move_type == pkmn_b.PokemonType.GRASS:
+    elif c_move_type == "grass":
         if ability == "sapsipper":
             return 0.0
 
@@ -394,34 +489,33 @@ def get_target_defense_multiplier(
         return 0.0
     if ability == "soundproof" and "sound" in flags:
         return 0.0
-    if ability == "goodasgold" and move.category == pkmn_b.MoveCategory.STATUS:
+    if ability == "goodasgold" and c_category == "status":
         return 0.0
 
     mult = 1.0
-
-    # Scrappy
-    if attacker_ability == "scrappy" and raw_type_multiplier == 0.0:
-        if effective_move_type in (pkmn_b.PokemonType.NORMAL, pkmn_b.PokemonType.FIGHTING):
-            mult *= 1.0
+    hp_frac = getattr(target, "current_hp_fraction", 0.0) or 0.0
 
     if ability == "auraguard" and "contact" in flags:
         mult *= 0.5
-    elif ability == "thickfat" and effective_move_type in (pkmn_b.PokemonType.FIRE, pkmn_b.PokemonType.ICE):
+    elif ability == "thickfat" and c_move_type in ("fire", "ice"):
         mult *= 0.5
-    elif ability == "heatproof" and effective_move_type == pkmn_b.PokemonType.FIRE:
+    elif ability in ("heatproof", "waterbubble") and c_move_type == "fire":
         mult *= 0.5
-    elif ability == "purifyingsalt" and effective_move_type == pkmn_b.PokemonType.GHOST:
+    elif ability == "purifyingsalt" and c_move_type == "ghost":
+        mult *= 0.5
+    elif ability == "punkrock" and "sound" in flags:
         mult *= 0.5
     elif ability == "fluffy":
-        if "contact" in flags:
+        if "contact" in flags and clean_str(getattr(attacker, "item", None)) != "protectivepads":
             mult *= 0.5
-        if effective_move_type == pkmn_b.PokemonType.FIRE:
+        if c_move_type == "fire":
             mult *= 2.0
-    elif ability == "furcoat" and move.category == pkmn_b.MoveCategory.PHYSICAL:
+    elif ability == "furcoat" and c_category == "physical":
         mult *= 0.5
-    elif ability == "icescales" and move.category == pkmn_b.MoveCategory.SPECIAL:
+    elif ability == "icescales" and c_category == "special":
         mult *= 0.5
-    elif ability in ("multiscale", "shadowshield") and target.current_hp_fraction == 1.0:
+
+    if ability in ("multiscale", "shadowshield") and hp_frac >= 0.999:
         mult *= 0.5
 
     if ability in ("solidrock", "filter", "prismarmor") and raw_type_multiplier > 1.0:
@@ -430,20 +524,22 @@ def get_target_defense_multiplier(
     return mult
 
 def get_held_item_multiplier(
-    move: pkmn_b.Move,
-    effective_move_type: pkmn_b.PokemonType,
-    attacker: pkmn_b.Pokemon,
-    target: pkmn_b.Pokemon | None,
+    move: MoveType,
+    effective_move_type: PokemonTypeEnumOrStr,
+    attacker: PokemonType_,
+    target: Optional[PokemonType_],
     raw_type_multiplier: float
 ) -> float:
     """Calculates damage modifiers from held items for both attacker and target."""
-    if move.category == pkmn_b.MoveCategory.STATUS:
+    c_category = clean_str(getattr(move, "category", ""))
+    if c_category == "status":
         return 1.0
     mult = 1.0
     attacker_item = clean_str(str(getattr(attacker, "item", "") or ""))
     flags = getattr(move, "flags", set())
-    is_physical = (move.category == pkmn_b.MoveCategory.PHYSICAL)
-    is_special = (move.category == pkmn_b.MoveCategory.SPECIAL)
+    is_physical = (c_category == "physical")
+    is_special = (c_category == "special")
+    c_move_type = clean_str(effective_move_type)
 
     if attacker_item == "choiceband" and is_physical:
         mult *= 1.5
@@ -453,15 +549,15 @@ def get_held_item_multiplier(
         mult *= 1.3
     elif attacker_item == "expertbelt" and raw_type_multiplier > 1.0:
         mult *= 1.2
-    elif constants.TYPE_BOOSTING_ITEMS.get(attacker_item) == effective_move_type:
+    elif clean_str(constants.TYPE_BOOSTING_ITEMS.get(attacker_item)) == c_move_type:
         mult *= 1.2
-    elif attacker_item in ("adamantcrystal", "adamantorb") and effective_move_type in (pkmn_b.PokemonType.STEEL, pkmn_b.PokemonType.DRAGON):
+    elif attacker_item in ("adamantcrystal", "adamantorb") and c_move_type in ("steel", "dragon"):
         mult *= 1.2
-    elif attacker_item in ("lustrousglobe", "lustrousorb") and effective_move_type in (pkmn_b.PokemonType.WATER, pkmn_b.PokemonType.DRAGON):
+    elif attacker_item in ("lustrousglobe", "lustrousorb") and c_move_type in ("water", "dragon"):
         mult *= 1.2
-    elif attacker_item in ("griseouscore", "griseousorb") and effective_move_type in (pkmn_b.PokemonType.GHOST, pkmn_b.PokemonType.DRAGON):
+    elif attacker_item in ("griseouscore", "griseousorb") and c_move_type in ("ghost", "dragon"):
         mult *= 1.2
-    elif attacker_item == "souldew" and effective_move_type in (pkmn_b.PokemonType.PSYCHIC, pkmn_b.PokemonType.DRAGON):
+    elif attacker_item == "souldew" and c_move_type in ("psychic", "dragon"):
         mult *= 1.2
     elif attacker_item == "punchingglove" and "punch" in flags:
         mult *= 1.1
@@ -472,7 +568,8 @@ def get_held_item_multiplier(
 
     if target is not None:
         target_item = clean_str(str(getattr(target, "item", "") or ""))
-        if constants.TYPE_RESIST_BERRIES.get(target_item) == effective_move_type:
+        resist_type = constants.TYPE_RESIST_BERRIES.get(target_item)
+        if resist_type and clean_str(resist_type) == c_move_type:
             if raw_type_multiplier > 1.0 or target_item == "chilanberry":
                 mult *= 0.5
         elif target_item == "assaultvest" and is_special:
@@ -483,76 +580,145 @@ def get_held_item_multiplier(
     return mult
 
 def get_effective_damage_multiplier(
-    move: pkmn_b.Move,
+    move: MoveType,
     raw_base_power: float,
-    attacker: pkmn_b.Pokemon,
-    target: Optional[pkmn_b.Pokemon],
-    battle: pkmn_b.DoubleBattle
+    attacker: PokemonType_,
+    target: Optional[PokemonType_],
+    battle: BattleType
 ) -> float:
     """
     Computes complete damage multiplier across:
     (BP-Boost * Attacker-Ability * STAB * Weather * Terrain * Type-Matchup * Tinted-Lens * Target-Defense)
     """
-    if move.category == pkmn_b.MoveCategory.STATUS or raw_base_power == 0.0 or target is None or target.fainted:
+    c_category = clean_str(getattr(move, "category", ""))
+    if c_category == "status" or raw_base_power == 0.0 or target is None or getattr(target, "fainted", False):
         return 0.0
 
-    move_type, bp_boost = get_move_type_and_bp_boost(move, attacker)
+    move_type, bp_boost = get_move_type_and_bp_boost(move, attacker, battle)
     mult = bp_boost
 
     mult *= get_attacker_ability_multiplier(move, raw_base_power, move_type, attacker, battle)
 
-    if move_type in getattr(attacker, "types", ()):
+    c_move_type = clean_str(move_type)
+    att_types = [clean_str(t) for t in getattr(attacker, "types", ())]
+    if c_move_type in att_types:
         ability = clean_str(getattr(attacker, "ability", None))
         mult *= 2.0 if ability == "adaptability" else 1.5
 
     attacker_ability = clean_str(getattr(attacker, "ability", None))
+    move_id = clean_str(getattr(move, "id", ""))
     is_sun = (
-        pkmn_b.Weather.SUNNYDAY in battle.weather or
-        pkmn_b.Weather.DESOLATELAND in battle.weather or
+        _has_weather(battle, ("sunnyday", "sun", "desolateland")) or
         attacker_ability == "megasol"
     )
-    is_rain = (
-        pkmn_b.Weather.RAINDANCE in battle.weather or
-        pkmn_b.Weather.PRIMORDIALSEA in battle.weather
+    is_rain = _has_weather(battle, ("raindance", "rain", "primordialsea")) and attacker_ability != "megasol"
+    is_bad_solar_weather = (
+        _has_weather(battle, ("raindance", "rain", "primordialsea", "sandstorm", "sand", "snowscape", "snow", "hail"))
+        and attacker_ability != "megasol"
     )
+    if move_id in ("solarbeam", "solarblade") and is_bad_solar_weather:
+        mult *= 0.5
 
-    if move_type == pkmn_b.PokemonType.FIRE:
+    if c_move_type == "fire":
         if is_sun:
             mult *= 1.5
         elif is_rain:
             mult *= 0.5
-    elif move_type == pkmn_b.PokemonType.WATER:
-        if is_rain:
+    elif c_move_type == "water":
+        if move_id == "hydrosteam" and is_sun:
+            mult *= 1.5
+        elif is_rain:
             mult *= 1.5
         elif is_sun:
             mult *= 0.5
 
     if is_grounded(attacker, battle):
-        if move_type == pkmn_b.PokemonType.GRASS and pkmn_b.Field.GRASSY_TERRAIN in battle.fields:
+        if c_move_type == "grass" and _has_field(battle, "grassyterrain"):
             mult *= 1.3
-        elif move_type == pkmn_b.PokemonType.ELECTRIC and pkmn_b.Field.ELECTRIC_TERRAIN in battle.fields:
+        elif c_move_type == "electric" and _has_field(battle, "electricterrain"):
             mult *= 1.3
-        elif move_type == pkmn_b.PokemonType.PSYCHIC and pkmn_b.Field.PSYCHIC_TERRAIN in battle.fields:
+        elif c_move_type == "psychic" and _has_field(battle, "psychicterrain"):
             mult *= 1.3
 
-    type_mult = target.damage_multiplier(move_type)
+    if is_grounded(target, battle):
+        if c_move_type == "dragon" and _has_field(battle, "mistyterrain"):
+            mult *= 0.5
+        elif clean_str(getattr(move, "id", "")) in ("earthquake", "bulldoze", "magnitude") and _has_field(battle, "grassyterrain"):
+            mult *= 0.5
+
+    if isinstance(target, pkmn_b.Pokemon):
+        if isinstance(move_type, pkmn_b.PokemonType):
+            type_mult = target.damage_multiplier(move_type)
+        elif isinstance(move, pkmn_b.Move):
+            type_mult = target.damage_multiplier(move)
+        else:
+            type_mult = target.damage_multiplier(pkmn_b.PokemonType.from_name(clean_str(move_type)))
+    else:
+        type_mult = target.damage_multiplier(move_type)
+
+    if type_mult == 0.0 and attacker_ability in ("scrappy", "mindseye") and c_move_type in ("normal", "fighting"):
+        type_mult = 1.0
+
+    ignores_ability = attacker_ability in ("moldbreaker", "teravolt", "turboblaze")
+    target_ability = clean_str(getattr(target, "ability", None))
+    if not ignores_ability and target_ability == "terashell" and (getattr(target, "current_hp_fraction", 0.0) or 0.0) >= 0.999 and type_mult > 0.0:
+        type_mult = 0.5
 
     if attacker_ability == "tintedlens" and 0.0 < type_mult < 1.0:
         type_mult *= 2.0
+
+    # Field-wide Aura & Ruin Abilities (Fairy Aura, Dark Aura, Aura Break, Tablets/Sword/Vessel/Beads of Ruin)
+    active_mons = [
+        p for p in (getattr(battle, "active_pokemon", []) + getattr(battle, "opponent_active_pokemon", []))
+        if p is not None and not getattr(p, "fainted", False)
+    ]
+    active_abilities = [clean_str(getattr(p, "ability", None)) for p in active_mons]
+    has_aura_break = "aurabreak" in active_abilities
+    if c_move_type == "fairy" and "fairyaura" in active_abilities:
+        mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+    elif c_move_type == "dark" and "darkaura" in active_abilities:
+        mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+
+    is_special = (c_category == "special")
+    target_raw_ability = clean_str(getattr(target, "ability", None))
+    if not is_special:
+        if attacker_ability != "tabletsofruin" and "tabletsofruin" in active_abilities:
+            mult *= 0.75
+        if target_raw_ability != "swordofruin" and "swordofruin" in active_abilities:
+            mult *= (4.0 / 3.0)
+    else:
+        if attacker_ability != "vesselofruin" and "vesselofruin" in active_abilities:
+            mult *= 0.75
+        if target_raw_ability != "beadsofruin" and "beadsofruin" in active_abilities:
+            mult *= (4.0 / 3.0)
 
     mult *= type_mult
 
     mult *= get_target_defense_multiplier(move, move_type, attacker, target, battle, type_mult)
     mult *= get_held_item_multiplier(move, move_type, attacker, target, type_mult)
+    
+    target_is_opponent = target not in battle.active_pokemon
+    side_conditions = battle.opponent_side_conditions if target_is_opponent else battle.side_conditions
+    if not attacker_ability == "infiltrator":
+        if isinstance(battle, pkmn_b.DoubleBattle):
+            if c_category == "physical" and pkmn_b.SideCondition.REFLECT in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions:
+                mult *= (2 / 3)
+            elif c_category == "special" and pkmn_b.SideCondition.LIGHT_SCREEN in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions:
+                mult *= (2 / 3)
+        elif isinstance(battle, SimulatedBattleState):
+            if c_category == "physical" and "reflect" in side_conditions or "auroraveil" in side_conditions:
+                mult *= (2 / 3)
+            elif c_category == "special" and "lightscreen" in side_conditions or "auroraveil" in side_conditions:
+                mult *= (2 / 3)
 
     return mult
 
 def evaluate_move_power_and_multipliers(
-    move: pkmn_b.Move,
-    attacker: pkmn_b.Pokemon,
-    target_1: Optional[pkmn_b.Pokemon],
-    target_2: Optional[pkmn_b.Pokemon],
-    battle: pkmn_b.DoubleBattle
+    move: MoveType,
+    attacker: PokemonType_,
+    target_1: Optional[PokemonType_],
+    target_2: Optional[PokemonType_],
+    battle: BattleType
 ) -> Tuple[float, float, float]:
     """
     Evaluates move against Target 1 and Target 2 with exact target-dependent base powers
@@ -565,7 +731,7 @@ def evaluate_move_power_and_multipliers(
 
     bp_1 = get_dynamic_base_power(move, attacker, target_1, battle)
     bp_2 = get_dynamic_base_power(move, attacker, target_2, battle)
-    nominal_bp = float(move.base_power)
+    nominal_bp = float(getattr(move, "base_power", 0.0))
 
     spread_penalty = get_spread_multiplier(move, attacker, target_1, target_2, battle)
 
@@ -576,3 +742,4 @@ def evaluate_move_power_and_multipliers(
     eff_damage_2 = (bp_2 * mult_2) / 300.0
 
     return nominal_bp, eff_damage_1, eff_damage_2
+

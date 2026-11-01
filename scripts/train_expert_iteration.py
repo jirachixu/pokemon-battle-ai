@@ -23,6 +23,12 @@ from poke_env.ps_client.account_configuration import AccountConfiguration
 from poke_env.player import SimpleHeuristicsPlayer
 
 from src.env import VGCEnv
+from src.evaluator import (
+    CompetitiveHeuristicEvaluator,
+    NeuralValueEvaluator,
+    HybridEvaluator,
+    swap_tensor_observations,
+)
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch
 from src.players import LookaheadPlayer
@@ -40,7 +46,8 @@ class ExpertIterationTrainer:
     1. Collects self-play or sparring battle trajectories where moves are chosen
     by the 2-turn Nash equilibrium lookahead search.
     2. Trains the MaskablePPO actor network to predict the lookahead's search policy.
-    3. Trains the MaskablePPO critic network to predict the final game outcome.
+    3. Trains the MaskablePPO critic network to predict the turn-discounted tactical & final game outcome
+    with zero-sum side-swapped perspective augmentation.
     """
 
     def __init__(
@@ -65,7 +72,14 @@ class ExpertIterationTrainer:
         self.training_environment = training_environment
         self.eval_environment = eval_environment
         self.search_depth = search_depth
+        self.heuristic_evaluator = CompetitiveHeuristicEvaluator()
         self.searcher = LookaheadSearch(
+            model=model,
+            evaluator=HybridEvaluator(
+                model=model,
+                heuristic_evaluator=self.heuristic_evaluator,
+                neural_weight=0.1,
+            ),
             depth=search_depth,
             max_candidates=search_candidates_limit,
         )
@@ -92,14 +106,14 @@ class ExpertIterationTrainer:
     def collect_lookahead_episode(self) -> tuple[float, int]:
         """
         Plays a full battle where every decision is computed by the 2-turn lookahead search.
-        Records the (observation, action_mask, search_policy_target) transitions.
+        Records the (observation, action_mask, search_policy_target, local_board_value) transitions.
         Returns (episode_reward, episode_turn_count).
         """
         if torch is None or self.preview_optimizer is None:
             raise RuntimeError("PyTorch is required to train the team preview model.")
         
         observation, _ = self.training_environment.reset()
-        episode_transitions: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]] = []
+        episode_transitions: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, float]] = []
         is_terminated = False
         is_truncated = False
         cumulative_reward = 0.0
@@ -166,8 +180,13 @@ class ExpertIterationTrainer:
                 if current_action_mask[sampled_action]:
                     chosen_action_code = sampled_action
 
+            # Compute immediate board heuristic value in [-1, 1] and blend with 2-turn lookahead search value
+            # so intermediate states preserve exact sensitivity to current material, HP%, speed control, and boosts
+            current_heur_norm = float(torch.tanh(self.heuristic_evaluator.evaluate(simulated_state) / 8000.0).item())
+            local_board_value = float(np.clip(0.50 * float(search_result.value) + 0.50 * current_heur_norm, -1.0, 1.0))
+
             # Record transition for this turn
-            episode_transitions.append((observation, current_action_mask, target_policy_distribution))
+            episode_transitions.append((observation, current_action_mask, target_policy_distribution, local_board_value))
 
             # 5. Step environment with the lookahead-chosen action
             observation, reward, is_terminated, is_truncated, _ = self.training_environment.step(chosen_action_code)
@@ -184,28 +203,66 @@ class ExpertIterationTrainer:
                 f"{team_info}"
             )
 
-        # Determine final battle outcome value for value head target: +1.0 for win, -1.0 for loss
-        final_game_outcome = 1.0 if cumulative_reward > 0.0 else (-1.0 if cumulative_reward < 0.0 else 0.0)
+        battle = self.training_environment.current_battle
+        
+        # Count living Pokémon and remaining HP fraction (0.0 to 4.0)
+        team_alive = [
+            p for p in battle.team.values()
+            if p and not p.fainted and getattr(p, "selected_in_teampreview", True)
+        ]
+        opp_revealed_alive = [
+            p for p in battle.opponent_team.values()
+            if p and not p.fainted and getattr(p, "revealed", False)
+        ]
+        opp_fainted_count = sum(1 for p in battle.opponent_team.values() if p and p.fainted)
+        opp_unrevealed_alive_count = max(0, 4 - opp_fainted_count - len(opp_revealed_alive))
+        opp_alive_count = len(opp_revealed_alive) + opp_unrevealed_alive_count
+
+        # Compute shaped outcome based on win/loss and remaining HP fraction, so that the value head can learn to 
+        # predict not just win/loss but also the degree of victory/defeat
+        team_hp_frac = sum(p.current_hp_fraction for p in team_alive if p.current_hp_fraction is not None)
+        opp_hp_frac = (
+            sum(p.current_hp_fraction for p in opp_revealed_alive if p.current_hp_fraction is not None)
+            + float(opp_unrevealed_alive_count)
+        )
+        if battle.won:
+            margin = (len(team_alive) + team_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
+            shaped_outcome = float(np.clip(0.55 + 0.45 * margin, 0.55, 1.0))
+        elif battle.lost:
+            opp_margin = (opp_alive_count + opp_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
+            shaped_outcome = float(np.clip(-0.55 - 0.45 * opp_margin, -1.0, -0.55))
+        else:
+            shaped_outcome = 0.0
+
         # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
-        # it will backprop through the policy loss part as well
-        advantage = final_game_outcome - preview_value.item()
+        # it will backprop through the policy loss part as well. This is for the preview model.
+        advantage = shaped_outcome - preview_value.item()
         policy_loss = -preview_log_probability * advantage
-        value_loss = 0.5 * ((preview_value - final_game_outcome) ** 2)
+        value_loss = 0.5 * ((preview_value - shaped_outcome) ** 2)
         entropy_loss = -0.01 * preview_data["entropy"]
         preview_loss = policy_loss + value_loss + entropy_loss
         
         self.preview_optimizer.zero_grad()
         preview_loss.backward()
         self.preview_optimizer.step()
+        
+        # Turn-discounted blending: final game outcome carries weight near the end of the battle,
+        # while earlier turns stay anchored to their tactical + 2-turn lookahead board value (local_value).
+        num_steps = len(episode_transitions)
+        GAMMA_OUTCOME = 0.85
+        MAX_OUTCOME_WEIGHT = 0.45
 
-        # Store transitions with final game outcome into the replay buffer
-        for transition_observation, transition_mask, transition_target_policy in episode_transitions:
+        # Store transitions with turn-discounted blended value targets into the replay buffer
+        for step_idx, (transition_observation, transition_mask, transition_target_policy, local_value) in enumerate(episode_transitions):
+            steps_from_end = (num_steps - 1) - step_idx
+            outcome_weight = MAX_OUTCOME_WEIGHT * (GAMMA_OUTCOME ** steps_from_end)
+            blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
             self.replay_buffer.append(
                 Transition(
                     observation=transition_observation,
                     action_mask=transition_mask,
                     target_policy=transition_target_policy,
-                    target_value=final_game_outcome,
+                    target_value=float(np.clip(blended_value_target, -1.0, 1.0)),
                 )
             )
 
@@ -272,9 +329,15 @@ class ExpertIterationTrainer:
         # Cross-Entropy Policy Loss: trains the network to output the search distribution
         policy_loss = -(target_policies_tensor * log_probabilities).sum(dim=-1).mean()
 
-        # Mean Squared Error Value Loss: trains the critic to predict the game outcome
+        # Mean Squared Error Value Loss with Zero-Sum Swapped-Perspective Augmentation:
+        # Trains V(S) -> target_value AND V(swap(S)) -> -target_value to eliminate side bias
         predicted_values = self.model.policy.predict_values(observation_tensors)  # Shape: (batch_size, 1)
-        value_loss = 0.5 * torch.nn.functional.mse_loss(predicted_values, target_values_tensor)
+        swapped_observation_tensors = swap_tensor_observations(observation_tensors)
+        predicted_swapped_values = self.model.policy.predict_values(swapped_observation_tensors)  # Shape: (batch_size, 1)
+        value_loss = 0.25 * (
+            torch.nn.functional.mse_loss(predicted_values, target_values_tensor)
+            + torch.nn.functional.mse_loss(predicted_swapped_values, -target_values_tensor)
+        )
 
         # Policy Entropy Regularization: prevents mode collapse onto deterministic single actions
         probabilities = torch.softmax(predicted_logits, dim=-1)
@@ -463,7 +526,7 @@ def main():
         battle_format="gen9championsvgc2026regmc",
         team=team_paste,
         depth=2,
-        max_candidates=8,
+        max_candidates=9,
         team_preview_model=preview_model,
     )
     raw_environment = VGCEnv(opponent=training_opponent)
@@ -504,7 +567,7 @@ def main():
         preview_model=preview_model,
         eval_environment=eval_environment,
         search_depth=2,
-        search_candidates_limit=8,
+        search_candidates_limit=9,
         replay_buffer_capacity=100000,
         learning_rate=1e-4,
         batch_size=64,
@@ -522,7 +585,7 @@ def main():
     eval_environment.agent.team_preview_model = trainer.preview_model
 
     trainer.learn(
-        total_episodes=3000,
+        total_episodes=15000,
         training_steps_per_episode=8,
         checkpoint_frequency=25,
         start_episode=start_episode,

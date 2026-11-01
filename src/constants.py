@@ -4,6 +4,9 @@ CATEGORY_TO_IDX = {
     pkmn_b.MoveCategory.PHYSICAL: 0,
     pkmn_b.MoveCategory.SPECIAL: 1,
     pkmn_b.MoveCategory.STATUS: 2,
+    "physical": 0,
+    "special": 1,
+    "status": 2,
 }
 
 TYPE_TO_IDX = {
@@ -24,7 +27,25 @@ TYPE_TO_IDX = {
     pkmn_b.PokemonType.DRAGON: 14,
     pkmn_b.PokemonType.DARK: 15,
     pkmn_b.PokemonType.STEEL: 16,
-    pkmn_b.PokemonType.FAIRY: 17
+    pkmn_b.PokemonType.FAIRY: 17,
+    "normal": 0,
+    "fire": 1,
+    "water": 2,
+    "electric": 3,
+    "grass": 4,
+    "ice": 5,
+    "fighting": 6,
+    "poison": 7,
+    "ground": 8,
+    "flying": 9,
+    "psychic": 10,
+    "bug": 11,
+    "rock": 12,
+    "ghost": 13,
+    "dragon": 14,
+    "dark": 15,
+    "steel": 16,
+    "fairy": 17,
 }
 
 STATUS_TO_IDX = {
@@ -33,7 +54,19 @@ STATUS_TO_IDX = {
     pkmn_b.Status.BRN: 2,
     pkmn_b.Status.FRZ: 3,
     pkmn_b.Status.PAR: 4,
-    pkmn_b.Status.SLP: 5
+    pkmn_b.Status.SLP: 5,
+    "psn": 0,
+    "tox": 1,
+    "brn": 2,
+    "frz": 3,
+    "par": 4,
+    "slp": 5,
+    "poison": 0,
+    "toxic": 1,
+    "burn": 2,
+    "freeze": 3,
+    "paralysis": 4,
+    "sleep": 5,
 }
 
 BOOSTABLE_STAT_TO_IDX = {
@@ -1162,4 +1195,36 @@ MEGA_STONE_PRIORS = {
         "absolitez": 0.99,
         "absolite": 0.01
     }
+}
+
+_SOUND_MOVES: set[str] = {
+    "alluringvoice", "boomburst", "bugbuzz", "chatter", "clangingscales",
+    "clangoroussoul", "clangoroussoulblaze", "confide", "disarmingvoice",
+    "echoedvoice", "eeriespell", "grasswhistle", "growl", "healbell",
+    "howl", "hypervoice", "metalsound", "nobleroar", "overdrive",
+    "partingshot", "perishsong", "psychicnoise", "relicsong", "roar",
+    "round", "screech", "sing", "snarl", "snore", "sparklingaria",
+    "supersonic", "torchsong", "uproar"
+}
+
+_TWO_TURN_CHARGE_MOVES: set[str] = {
+    "electroshot", "solarbeam", "solarblade", "meteorbeam", "geomancy",
+    "skyattack", "skullbash", "razorwind", "freezeshock", "iceburn",
+    "fly", "bounce", "dig", "dive", "phantomforce", "shadowforce", "skydrop"
+}
+
+_BULLET_MOVES: set[str] = {
+    "acidspray", "aurasphere", "barrage", "beakblast", "bulletseed",
+    "eggbomb", "electroball", "energyball", "focusblast", "gyroball",
+    "iceball", "magnetbomb", "mistball", "mudbomb", "octazooka",
+    "pollenpuff", "pyroball", "rockblast", "rockwrecker", "searingshot",
+    "seedbomb", "shadowball", "sludgebomb", "syrupbomb", "weatherball",
+    "zapcannon"
+}
+
+_DEFAULT_RECOIL_RATIOS: dict[str, float] = {
+    "flareblitz": 0.33, "bravebird": 0.33, "wavecrash": 0.33,
+    "woodhammer": 0.33, "doubleedge": 0.33, "volttackle": 0.33,
+    "wildcharge": 0.25, "headcharge": 0.25, "takedown": 0.25, "submission": 0.25,
+    "headsmash": 0.50, "lightofruin": 0.50,
 }

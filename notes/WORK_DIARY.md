@@ -162,3 +162,15 @@ I think my next steps should be to have it train and play against an agent that 
 ## 2026/10/15
 
 Since the previous entry I've made a number of changes that I forgot to log here. Basically though, I implemented the two next steps from my previous entry, and I have also adjusted/added to the simulation and search where it was previously lacking (disabled moves or unselectable moves, perish song, struggle, better type handling for moves like burn up). Eval has also been updated to also provide statistics for when the agent plays with a team of each archetype, and against a team of each archetype. I'm thinking that I will run a fairly large number of episodes before implementing some way to use the value head to assess board states in lookahead, and if that proves superior, I will probably just completely replace the hardcoded heuristic. Then I will run a bunch of training episodes again and then if/when it ends up being good enough I'll let the policy head take over candidate action selection completely.
+
+## 2026/10/16
+
+So I've changed the state encoder and damage calc, along with refactoring some of the attribute names in simulation so that the SimulatedPokemon, SimulatedMove, SimulatedBattleState can all be used directly with the state encoder, so that the value head will be able to be used for lookahead state evaluation.
+
+## 2026/10/17
+
+I updated the simulation and other relevant parts extensively because I realized that there were actually quite a few things that weren't properly accounted for. It was fine before because I was only using one sample team, but now that I'm sampling from a big pool there are many archetypes and strategies in play.
+
+## 2026/10/31
+
+Last week, I had more midterms so I was not really able to work on this project. Since then though, the main changes that have been made have been greatly expanded simulation, slightly updated state encoder, and the ability to use the value head either by itself or as a hybrid with the heuristic to evaluate any given position. The implementation of this is still in its early stages however, as higher depths and other tweaks are needed for certain archetypes like perish trap, which basically require higher depth to fully evaluate. The value head also seems to somehow be unideal despite low loss and overall sensible outputs, leading to a lower winrate during eval against the simple heuristic bot than pure heuristic lookahead search. This is obviously frustrating, as I really don't know what's holding the value head back currently, but given that it does at least win some 75-80% in eval, this is at least clear proof that the value head *is* better than the simple heuristic bot.

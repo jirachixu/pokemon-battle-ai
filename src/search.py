@@ -12,9 +12,14 @@ from src.simulation import (
     SimulatedAction,
     step_simulation,
     clean_id,
+    is_pokemon_grounded,
+    is_charge_move_instant,
+    get_effective_move_priority,
+    _SOUND_MOVES,
+    _TWO_TURN_CHARGE_MOVES,
 )
 import src.constants as constants
-from src.evaluator import BattleStateEvaluator, CompetitiveHeuristicEvaluator
+from src.evaluator import BattleStateEvaluator, CompetitiveHeuristicEvaluator, NeuralValueEvaluator
 from poke_env.player import Player
 from poke_env.player.battle_order import DoubleBattleOrder, PassBattleOrder
 from src.constants import (
@@ -192,11 +197,12 @@ class LookaheadSearch:
     def __init__(
         self,
         evaluator: Optional[BattleStateEvaluator] = None,
+        model = None,
         depth: int = 2,
-        max_candidates: int = 10,
+        max_candidates: int = 9,
         **kwargs: Any,
     ) -> None:
-        self.evaluator = evaluator or CompetitiveHeuristicEvaluator()
+        self.evaluator = evaluator or NeuralValueEvaluator(model=model) if model is not None else CompetitiveHeuristicEvaluator()
         self.depth = depth
         self.method = "nash"
         self.max_candidates = max_candidates
@@ -224,9 +230,9 @@ class LookaheadSearch:
         policy_prior: Optional[np.ndarray] = None,
     ) -> list[tuple[SimulatedAction, SimulatedAction]]:
         """Generates top joint candidate actions (slot 0, slot 1) for Doubles."""
-        active_pokemon_list = state.side1_active if side == 1 else state.side2_active
-        bench_pokemon_list = state.side1_bench if side == 1 else state.side2_bench
-        opponent_pokemon_list = state.side2_active if side == 1 else state.side1_active
+        active_pokemon_list = state.active_pokemon if side == 1 else state.opponent_active_pokemon
+        bench_pokemon_list = state.bench if side == 1 else state.opponent_bench
+        opponent_pokemon_list = state.opponent_active_pokemon if side == 1 else state.active_pokemon
 
         slot0_candidates = self._get_slot_candidates(state, active_pokemon_list, bench_pokemon_list, opponent_pokemon_list, slot=0)
         slot1_candidates = self._get_slot_candidates(state, active_pokemon_list, bench_pokemon_list, opponent_pokemon_list, slot=1)
@@ -410,7 +416,24 @@ class LookaheadSearch:
                     for opponent_pokemon in opponent_pokemon_list:
                         if opponent_pokemon and not opponent_pokemon.fainted:
                             for opponent_type in opponent_pokemon.types:
-                                if bench_pokemon.damage_multiplier(opponent_type) < 1.0:
+                                eff_mult = bench_pokemon.damage_multiplier(opponent_type)
+                                if bench_pokemon.ability == "thickfat" and opponent_type in ("fire", "ice"):
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability in ("heatproof", "waterbubble") and opponent_type == "fire":
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability == "purifyingsalt" and opponent_type == "ghost":
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability in ("levitate", "eelevate", "eartheater") and opponent_type == "ground":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("flashfire", "wellbakedbody") and opponent_type == "fire":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("waterabsorb", "stormdrain", "dryskin") and opponent_type == "water":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("voltabsorb", "lightningrod", "motordrive") and opponent_type == "electric":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability == "sapsipper" and opponent_type == "grass":
+                                    eff_mult = 0.0
+                                if eff_mult < 1.0:
                                     switch_score += 20.0
                     available_switches.append((switch_score, SimulatedAction("switch", slot=slot, switch_idx=bench_index)))
 
@@ -426,13 +449,30 @@ class LookaheadSearch:
             # Regular turn and slot is fainted: must pass
             return [(0.0, SimulatedAction("pass", slot=slot))]
 
+        # If actively charging a two-turn move, the Pokemon is locked into completing it this turn
+        if active_pokemon.charging_move:
+            return [(
+                100.0,
+                SimulatedAction(
+                    "move",
+                    slot=slot,
+                    move_id=active_pokemon.charging_move,
+                    target_idx=active_pokemon.charging_target,
+                    mega=False,
+                ),
+            )]
+
         slot_candidates: list[tuple[float, SimulatedAction]] = []
 
-        side_mega_used = state.side1_mega_used if (active_pokemon and active_pokemon.side == 1) else state.side2_mega_used
+        side_mega_used = state.mega_used if (active_pokemon and active_pokemon.side == 1) else state.opponent_mega_used
         can_mega_now = bool(active_pokemon and active_pokemon.can_mega_evolve and not side_mega_used)
 
         is_doubles = (state.battle_format == "doubles")
         partner = active_pokemon_list[1 - slot] if (is_doubles and len(active_pokemon_list) > 1) else None
+        all_active = [p for p in state.active_pokemon + state.opponent_active_pokemon if p and not p.fainted]
+        has_aura_break = any(p.ability == "aurabreak" for p in all_active)
+        has_fairy_aura = any(p.ability == "fairyaura" for p in all_active)
+        has_dark_aura = any(p.ability == "darkaura" for p in all_active)
 
         # Evaluate all moves in active Pokemon's moveset without dropping any move
         for move_id, simulated_move in active_pokemon.moves.items():
@@ -445,6 +485,8 @@ class LookaheadSearch:
                 continue  # Locked into encored move
             if active_pokemon.torment and active_pokemon.last_move_used and move_id == active_pokemon.last_move_used:
                 continue  # Cannot select same move consecutively under Torment
+            if active_pokemon.throat_chop_turns > 0 and ("sound" in simulated_move.flags or move_id in _SOUND_MOVES):
+                continue  # Cannot select sound moves while affected by Throat Chop
             if active_pokemon.item == "assaultvest" and simulated_move.category == "status":
                 continue  # Cannot select status moves with Assault Vest
             if active_pokemon.item in ("choiceband", "choicespecs", "choicescarf"):
@@ -454,29 +496,144 @@ class LookaheadSearch:
             if any(opp and not opp.fainted and opp.imprison and move_id in opp.moves for opp in opponent_pokemon_list):
                 continue
 
+            if move_id in ("fakeout", "firstimpression") and not active_pokemon.first_turn:
+                continue  # First-turn only moves fail after turn 1 on field
+
+            eff_priority = get_effective_move_priority(simulated_move, active_pokemon, state.fields)
+            ignores_ability = active_pokemon.ability in ("moldbreaker", "teravolt", "turboblaze")
+            opp_blocks_priority = not ignores_ability and any(
+                opp and not opp.fainted and opp.ability in ("dazzling", "queenlymajesty", "armortail")
+                for opp in opponent_pokemon_list
+            )
+            opp_side_conditions = state.opponent_side_conditions if active_pokemon.side == 1 else state.side_conditions
+
+            is_charge_move = (move_id in _TWO_TURN_CHARGE_MOVES or "charge" in simulated_move.flags)
+            charge_is_instant = is_charge_move_instant(move_id, active_pokemon, state.weather) if is_charge_move else True
+
             # 1. Attacking moves (physical / special)
             if simulated_move.category != "status":
                 eff_power = get_effective_base_power(simulated_move)
-                stab = 1.5 if simulated_move.type in active_pokemon.types else 1.0
-                is_spread = simulated_move.is_spread or simulated_move.target in ("allAdjacentFoes", "allAdjacent")
+                eff_type = simulated_move.type
+                is_special = (simulated_move.category == "special")
+
+                if move_id == "expandingforce" and "psychicterrain" in state.fields and is_pokemon_grounded(active_pokemon, state.fields):
+                    eff_power = 120.0
+                elif move_id == "psyblade" and "electricterrain" in state.fields:
+                    eff_power = 120.0
+                elif move_id == "mistyexplosion" and "mistyterrain" in state.fields and is_pokemon_grounded(active_pokemon, state.fields):
+                    eff_power = 150.0
+                elif move_id == "weatherball":
+                    if any(w in state.weather for w in ("sunnyday", "desolateland", "sun")) or active_pokemon.ability == "megasol":
+                        eff_power, eff_type = 100.0, "fire"
+                    elif any(w in state.weather for w in ("raindance", "primordialsea", "rain")):
+                        eff_power, eff_type = 100.0, "water"
+                    elif any(w in state.weather for w in ("sandstorm", "sand")):
+                        eff_power, eff_type = 100.0, "rock"
+                    elif any(w in state.weather for w in ("snowscape", "hail", "snow")):
+                        eff_power, eff_type = 100.0, "ice"
+                elif move_id == "terrainpulse" and is_pokemon_grounded(active_pokemon, state.fields):
+                    if "electricterrain" in state.fields: eff_power, eff_type = 100.0, "electric"
+                    elif "grassyterrain" in state.fields: eff_power, eff_type = 100.0, "grass"
+                    elif "psychicterrain" in state.fields: eff_power, eff_type = 100.0, "psychic"
+                    elif "mistyterrain" in state.fields: eff_power, eff_type = 100.0, "fairy"
+
+                if move_id in ("electroshot", "meteorbeam"):
+                    eff_power *= 1.5  # Accounts for +1 SpA boost applied before firing
+
+                if eff_type == "normal":
+                    if active_pokemon.ability == "pixilate": eff_type, eff_power = "fairy", eff_power * 1.2
+                    elif active_pokemon.ability == "aerilate": eff_type, eff_power = "flying", eff_power * 1.2
+                    elif active_pokemon.ability == "refrigerate": eff_type, eff_power = "ice", eff_power * 1.2
+                    elif active_pokemon.ability == "galvanize": eff_type, eff_power = "electric", eff_power * 1.2
+                    elif active_pokemon.ability == "dragonize": eff_type, eff_power = "dragon", eff_power * 1.2
+
+                stab = (2.0 if active_pokemon.ability == "adaptability" else 1.5) if eff_type in active_pokemon.types else 1.0
+
+                field_mult = 1.0
+                if eff_type == "fairy" and has_fairy_aura:
+                    field_mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+                elif eff_type == "dark" and has_dark_aura:
+                    field_mult *= 0.75 if has_aura_break else (4.0 / 3.0)
+                is_sunny = any(w in state.weather for w in ("sunnyday", "desolateland", "sun")) or active_pokemon.ability == "megasol"
+                is_rainy = any(w in state.weather for w in ("raindance", "primordialsea", "rain")) and active_pokemon.ability != "megasol"
+                is_bad_solar_weather = (
+                    any(w in state.weather for w in ("raindance", "primordialsea", "rain", "sandstorm", "sand", "snowscape", "hail", "snow"))
+                    and active_pokemon.ability != "megasol"
+                )
+                if move_id in ("solarbeam", "solarblade") and is_bad_solar_weather:
+                    field_mult *= 0.5
+                if eff_type == "fire":
+                    if is_sunny: field_mult *= 1.5
+                    elif is_rainy: field_mult *= 0.5
+                elif eff_type == "water":
+                    if move_id == "hydrosteam" and is_sunny: field_mult *= 1.5
+                    elif is_rainy: field_mult *= 1.5
+                    elif is_sunny: field_mult *= 0.5
+
+                if is_pokemon_grounded(active_pokemon, state.fields):
+                    if "psychicterrain" in state.fields and eff_type == "psychic": field_mult *= 1.3
+                    elif "electricterrain" in state.fields and eff_type == "electric": field_mult *= 1.3
+                    elif "grassyterrain" in state.fields and eff_type == "grass": field_mult *= 1.3
+                if active_pokemon.ability == "sandforce" and any(w in state.weather for w in ("sandstorm", "sand")) and eff_type in ("rock", "ground", "steel"):
+                    field_mult *= 1.3
+
+                if active_pokemon.ability != "infiltrator" and move_id not in ("brickbreak", "psychicfangs", "ragingbull"):
+                    if not is_special and ("reflect" in opp_side_conditions or "auroraveil" in opp_side_conditions):
+                        field_mult *= 0.66
+                    elif is_special and ("lightscreen" in opp_side_conditions or "auroraveil" in opp_side_conditions):
+                        field_mult *= 0.66
+
+                is_expanding_force_spread = (
+                    move_id == "expandingforce"
+                    and "psychicterrain" in state.fields
+                    and is_pokemon_grounded(active_pokemon, state.fields)
+                )
+                is_spread = simulated_move.is_spread or simulated_move.target in ("allAdjacentFoes", "allAdjacent") or is_expanding_force_spread
 
                 if is_spread:
+                    if eff_priority > 0 and opp_blocks_priority:
+                        continue
                     # Spread move hits both opponents simultaneously
                     total_dmg_frac = 0.0
                     alive_opp_count = 0
                     for opp in opponent_pokemon_list:
                         if opp and not opp.fainted:
-                            t_mult = opp.damage_multiplier(simulated_move.type)
+                            if eff_priority > 0 and "psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                continue
+                            opp_eff_ability = opp.ability if (not ignores_ability or opp.ability in ("fullmetalbody", "shadowshield", "prismarmor", "comatose")) else ""
+                            if eff_type == "ground" and opp_eff_ability in ("levitate", "eelevate", "eartheater") and not is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                continue
+                            t_mult = opp.damage_multiplier(eff_type)
                             if t_mult > 0.0:
-                                est_dmg = eff_power * stab * t_mult * 0.75  # 0.75 spread damage penalty in Doubles
+                                if opp_eff_ability == "terashell" and opp.current_hp >= opp.max_hp - 1e-6:
+                                    t_mult = 0.5
+                                opp_field_mult = field_mult
+                                if is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                    if "mistyterrain" in state.fields and eff_type == "dragon":
+                                        opp_field_mult *= 0.5
+                                    if "grassyterrain" in state.fields and move_id in ("earthquake", "bulldoze", "magnitude"):
+                                        opp_field_mult *= 0.5
+                                if opp_eff_ability in ("multiscale", "shadowshield") and opp.current_hp >= opp.max_hp - 1e-6:
+                                    opp_field_mult *= 0.5
+                                if opp_eff_ability == "thickfat" and eff_type in ("fire", "ice"):
+                                    opp_field_mult *= 0.5
+                                elif opp_eff_ability in ("heatproof", "waterbubble") and eff_type == "fire":
+                                    opp_field_mult *= 0.5
+                                elif opp_eff_ability == "purifyingsalt" and eff_type == "ghost":
+                                    opp_field_mult *= 0.5
+                                if opp_eff_ability in ("filter", "solidrock", "prismarmor") and t_mult > 1.0:
+                                    opp_field_mult *= 0.75
+                                est_dmg = eff_power * stab * opp_field_mult * t_mult * 0.75  # 0.75 spread damage penalty in Doubles
+                                if not charge_is_instant:
+                                    est_dmg *= 0.45
                                 total_dmg_frac += min(1.5, est_dmg / max(opp.current_hp, 1.0))
                                 alive_opp_count += 1
                     if alive_opp_count > 0:
                         avg_frac = total_dmg_frac / alive_opp_count
                         priority_score = 45.0 + 35.0 * min(1.0, avg_frac) + 10.0  # +10 spread bonus
-                        if avg_frac >= 0.90:
+                        if avg_frac >= 0.90 and charge_is_instant:
                             priority_score += 20.0  # Threatens KO
-                        if simulated_move.priority > 0:
+                        if eff_priority > 0:
                             priority_score += 10.0
                         slot_candidates.append(
                             (priority_score, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=0, mega=False))
@@ -491,16 +648,64 @@ class LookaheadSearch:
                         if target_index < len(opponent_pokemon_list):
                             opponent_pokemon = opponent_pokemon_list[target_index]
                             if opponent_pokemon and not opponent_pokemon.fainted:
-                                type_mult = opponent_pokemon.damage_multiplier(simulated_move.type)
+                                if eff_priority > 0:
+                                    if opp_blocks_priority:
+                                        continue
+                                    if "psychicterrain" in state.fields and is_pokemon_grounded(opponent_pokemon, state.fields, ignore_ability=ignores_ability):
+                                        continue
+                                opp_eff_ability = opponent_pokemon.ability if (not ignores_ability or opponent_pokemon.ability in ("fullmetalbody", "shadowshield", "prismarmor", "comatose")) else ""
+                                if eff_type == "ground" and opp_eff_ability in ("levitate", "eelevate", "eartheater") and not is_pokemon_grounded(opponent_pokemon, state.fields, ignore_ability=ignores_ability):
+                                    continue
+                                if eff_type == "fire" and opp_eff_ability in ("flashfire", "wellbakedbody"):
+                                    continue
+                                if eff_type == "water" and opp_eff_ability in ("waterabsorb", "stormdrain", "dryskin"):
+                                    continue
+                                if eff_type == "electric" and opp_eff_ability in ("voltabsorb", "lightningrod", "motordrive"):
+                                    continue
+                                if eff_type == "grass" and opp_eff_ability == "sapsipper":
+                                    continue
+                                if opp_eff_ability == "soundproof" and ("sound" in simulated_move.flags or move_id in _SOUND_MOVES):
+                                    continue
+                                if opp_eff_ability == "bulletproof" and "bullet" in simulated_move.flags:
+                                    continue
+                                type_mult = opponent_pokemon.damage_multiplier(eff_type)
                                 if type_mult == 0.0:
-                                    continue  # Immune, skip this target
-                                est_dmg = eff_power * stab * type_mult
+                                    if not (active_pokemon.ability in ("scrappy", "mindseye") and eff_type in ("normal", "fighting")):
+                                        continue  # Immune, skip this target
+                                    type_mult = 1.0
+                                if opp_eff_ability == "terashell" and opponent_pokemon.current_hp >= opponent_pokemon.max_hp - 1e-6:
+                                    type_mult = 0.5
+                                target_power = eff_power
+                                if move_id == "risingvoltage" and "electricterrain" in state.fields and is_pokemon_grounded(opponent_pokemon, state.fields, ignore_ability=ignores_ability):
+                                    target_power = 140.0
+                                opp_field_mult = field_mult
+                                if is_pokemon_grounded(opponent_pokemon, state.fields, ignore_ability=ignores_ability):
+                                    if "mistyterrain" in state.fields and eff_type == "dragon":
+                                        opp_field_mult *= 0.5
+                                    if "grassyterrain" in state.fields and move_id in ("earthquake", "bulldoze", "magnitude"):
+                                        opp_field_mult *= 0.5
+                                if opp_eff_ability in ("multiscale", "shadowshield") and opponent_pokemon.current_hp >= opponent_pokemon.max_hp - 1e-6:
+                                    opp_field_mult *= 0.5
+                                if opp_eff_ability == "thickfat" and eff_type in ("fire", "ice"):
+                                    opp_field_mult *= 0.5
+                                elif opp_eff_ability in ("heatproof", "waterbubble") and eff_type == "fire":
+                                    opp_field_mult *= 0.5
+                                elif opp_eff_ability == "purifyingsalt" and eff_type == "ghost":
+                                    opp_field_mult *= 0.5
+                                if opp_eff_ability in ("filter", "solidrock", "prismarmor") and type_mult > 1.0:
+                                    opp_field_mult *= 0.75
+                                est_dmg = target_power * stab * opp_field_mult * type_mult
+                                if not charge_is_instant:
+                                    est_dmg *= 0.45
                                 dmg_frac = min(1.5, est_dmg / max(opponent_pokemon.current_hp, 1.0))
                                 priority_score = 45.0 + 35.0 * min(1.0, dmg_frac)
-                                if dmg_frac >= 0.95:
+                                if dmg_frac >= 0.95 and charge_is_instant:
                                     priority_score += 25.0  # Decisive KO threat
-                                if simulated_move.priority > 0:
+                                if eff_priority > 0:
                                     priority_score += 10.0
+                                if move_id == "fakeout" and active_pokemon.first_turn:
+                                    if opp_eff_ability not in ("innerfocus", "shielddust") and opponent_pokemon.item != "covertcloak":
+                                        priority_score += 25.0  # High priority for Fake Out flinch
                                 slot_candidates.append(
                                     (priority_score, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=target_index, mega=False))
                                 )
@@ -516,7 +721,7 @@ class LookaheadSearch:
                         slot_candidates.append(
                             (heal_priority, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=2, mega=False))
                         )
-                    elif (partner.item == "weaknesspolicy" and partner.damage_multiplier(simulated_move.type) > 1.0):
+                    elif (partner.item == "weaknesspolicy" and partner.damage_multiplier(eff_type) > 1.0):
                         slot_candidates.append(
                             (75.0, SimulatedAction("move", slot=slot, move_id=move_id, target_idx=2, mega=False))
                         )
@@ -536,11 +741,13 @@ class LookaheadSearch:
                         (priority_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 elif mid == "fakeout":
-                    if active_pokemon.first_turn:
+                    if active_pokemon.first_turn and not opp_blocks_priority:
                         for target_index in (0, 1):
                             if target_index < len(opponent_pokemon_list):
                                 opp = opponent_pokemon_list[target_index]
                                 if opp and not opp.fainted and opp.damage_multiplier("normal") > 0.0:
+                                    if "psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                        continue
                                     slot_candidates.append(
                                         (80.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                     )
@@ -550,20 +757,27 @@ class LookaheadSearch:
                         (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 elif mid == "tailwind":
-                    state_conditions = state.side1_conditions if (active_pokemon and active_pokemon.side == 1) \
-                        else state.side2_conditions
+                    state_conditions = state.side_conditions if (active_pokemon and active_pokemon.side == 1) \
+                        else state.opponent_side_conditions
                     if state_conditions.get("tailwind", 0) == 0:
                         slot_candidates.append(
                             (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                         )
                 # Sleep Infliction
-                elif mid in ("spore", "sleeppowder", "hypnosis", "yawn"):
+                elif mid in ("spore", "sleeppowder", "hypnosis", "darkvoid", "sing", "yawn", "lovelykiss"):
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
                             if opp and not opp.fainted and not opp.status:
+                                opp_eff_ability = opp.ability if (not ignores_ability or opp.ability == "comatose") else ""
+                                if opp_eff_ability in ("goodasgold", "vitalspirit", "insomnia", "purifyingsalt", "sweetveil", "comatose"):
+                                    continue
+                                if eff_priority > 0 and (opp_blocks_priority or ("psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability)) or (active_pokemon.ability == "prankster" and "dark" in opp.types)):
+                                    continue
+                                if ("electricterrain" in state.fields or "mistyterrain" in state.fields) and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                    continue
                                 # Grass types and Safety Goggles immune to Spore/Sleep Powder
-                                if mid in ("spore", "sleeppowder") and ("grass" in opp.types or opp.item == "safetygoggles"):
+                                if mid in ("spore", "sleeppowder") and ("grass" in opp.types or opp.item == "safetygoggles" or opp_eff_ability == "overcoat"):
                                     continue
                                 score = 85.0 if mid == "spore" else 75.0
                                 slot_candidates.append(
@@ -574,7 +788,10 @@ class LookaheadSearch:
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
-                            if opp and not opp.fainted and opp.last_move_used and opp.encore_turns == 0:
+                            opp_eff_ability = opp.ability if (opp and not ignores_ability) else ""
+                            if opp and not opp.fainted and opp.last_move_used and opp.encore_turns == 0 and opp_eff_ability != "goodasgold":
+                                if eff_priority > 0 and (opp_blocks_priority or ("psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability)) or (active_pokemon.ability == "prankster" and "dark" in opp.types)):
+                                    continue
                                 slot_candidates.append(
                                     (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
@@ -582,7 +799,10 @@ class LookaheadSearch:
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
-                            if opp and not opp.fainted and opp.taunt_turns == 0:
+                            opp_eff_ability = opp.ability if (opp and not ignores_ability) else ""
+                            if opp and not opp.fainted and opp.taunt_turns == 0 and opp_eff_ability != "goodasgold":
+                                if eff_priority > 0 and (opp_blocks_priority or ("psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability)) or (active_pokemon.ability == "prankster" and "dark" in opp.types)):
+                                    continue
                                 slot_candidates.append(
                                     (80.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
@@ -597,7 +817,10 @@ class LookaheadSearch:
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
-                            if opp and not opp.fainted and opp.last_move_used and opp.disable_turns == 0:
+                            opp_eff_ability = opp.ability if (opp and not ignores_ability) else ""
+                            if opp and not opp.fainted and opp.last_move_used and opp.disable_turns == 0 and opp_eff_ability != "goodasgold":
+                                if eff_priority > 0 and (opp_blocks_priority or ("psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability)) or (active_pokemon.ability == "prankster" and "dark" in opp.types)):
+                                    continue
                                 slot_candidates.append(
                                     (70.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
@@ -616,8 +839,9 @@ class LookaheadSearch:
                     "irondefense", "shellsmash", "bellydrum", "shiftgear", "tidyup", "geomancy",
                     "victorydance", "coil", "growth", "workup", "acidarmor", "amnesia"
                 ):
+                    setup_score = (85.0 if charge_is_instant else 55.0) if mid == "geomancy" else 75.0
                     slot_candidates.append(
-                        (75.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
+                        (setup_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 # Substitute
                 elif mid == "substitute":
@@ -626,23 +850,30 @@ class LookaheadSearch:
                         (sub_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 # Status Infliction (Burn, Paralysis, Toxic)
-                elif mid in ("willowisp", "thunderwave", "glare", "toxic", "stunspore"):
+                elif mid in ("willowisp", "thunderwave", "glare", "toxic", "stunspore", "poisonpowder", "poisongas"):
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
                             if opp and not opp.fainted and not opp.status:
+                                opp_eff_ability = opp.ability if (not ignores_ability or opp.ability == "comatose") else ""
+                                if opp_eff_ability in ("goodasgold", "purifyingsalt", "comatose"):
+                                    continue
+                                if eff_priority > 0 and (opp_blocks_priority or ("psychicterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability)) or (active_pokemon.ability == "prankster" and "dark" in opp.types)):
+                                    continue
+                                if "mistyterrain" in state.fields and is_pokemon_grounded(opp, state.fields, ignore_ability=ignores_ability):
+                                    continue
                                 if mid == "willowisp" and "fire" in opp.types:
                                     continue
-                                if mid in ("thunderwave", "glare") and ("electric" in opp.types or "ground" in opp.types):
+                                if mid in ("thunderwave", "glare") and ("electric" in opp.types or (mid == "thunderwave" and "ground" in opp.types)):
                                     continue
-                                if mid == "toxic" and ("poison" in opp.types or "steel" in opp.types):
+                                if mid in ("toxic", "poisonpowder", "poisongas") and ("poison" in opp.types or "steel" in opp.types):
                                     continue
                                 slot_candidates.append(
                                     (70.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
                 # Ally Buffs
                 elif is_ally_buff_move(simulated_move):
-                    if is_doubles and partner and not partner.fainted:
+                    if is_doubles and partner and not partner.fainted and (ignores_ability or partner.ability != "goodasgold"):
                         buff_score = 80.0 if mid in ("coaching", "decorate") else 70.0
                         slot_candidates.append(
                             (buff_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=2, mega=False))
@@ -660,8 +891,11 @@ class LookaheadSearch:
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
-                            if opp and not opp.fainted:
+                            opp_eff_ability = opp.ability if (opp and not ignores_ability) else ""
+                            if opp and not opp.fainted and opp_eff_ability != "goodasgold":
                                 sap_score = 75.0 if active_pokemon.current_hp_fraction < 0.50 else 50.0
+                                if opp.ability in ("defiant", "competitive") or opp_eff_ability in ("contrary", "mirrorarmor"):
+                                    sap_score -= 35.0
                                 slot_candidates.append(
                                     (sap_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
@@ -673,7 +907,10 @@ class LookaheadSearch:
                             for target_index in (0, 1):
                                 if target_index < len(opponent_pokemon_list):
                                     opp = opponent_pokemon_list[target_index]
-                                    if opp and not opp.fainted:
+                                    opp_eff_ability = opp.ability if (opp and (not ignores_ability or opp.ability == "fullmetalbody")) else ""
+                                    if opp and not opp.fainted and opp_eff_ability != "goodasgold":
+                                        if opp.item == "clearamulet" or opp_eff_ability in ("clearbody", "whitesmoke", "fullmetalbody", "mirrorarmor", "contrary") or opp.ability in ("defiant", "competitive"):
+                                            continue
                                         slot_candidates.append(
                                             (70.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                         )
@@ -681,16 +918,35 @@ class LookaheadSearch:
                             slot_candidates.append(
                                 (70.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                             )
+                elif mid == "auroraveil":
+                    if any(w in state.weather for w in ("snowscape", "hail", "snow")):
+                        slot_candidates.append(
+                            (75.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
+                        )
                 elif is_self_or_field_move(simulated_move):
                     slot_candidates.append(
                         (60.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 else:
-                    # General status move targeting opponent
+                    # General status move targeting opponent (including pure stat-lowering moves)
+                    is_stat_drop_status = mid in (
+                        "screech", "faketears", "metalsound", "charm", "featherdance",
+                        "eerieimpulse", "scaryface", "stringshot", "cottonspore",
+                        "tearfullook", "tickle", "sweetscent", "growl", "leer", "tailwhip",
+                        "confide", "nobleroar", "babydolleyes", "sandattack", "smokescreen"
+                    )
                     for target_index in (0, 1):
                         if target_index < len(opponent_pokemon_list):
                             opp = opponent_pokemon_list[target_index]
-                            if opp and not opp.fainted:
+                            opp_eff_ability = opp.ability if (opp and (not ignores_ability or opp.ability == "fullmetalbody")) else ""
+                            if opp and not opp.fainted and opp_eff_ability != "goodasgold":
+                                if is_stat_drop_status:
+                                    if opp.item == "clearamulet" or opp_eff_ability in ("clearbody", "whitesmoke", "fullmetalbody", "mirrorarmor", "contrary") or opp.ability in ("defiant", "competitive"):
+                                        continue
+                                    if mid in ("charm", "featherdance", "growl", "babydolleyes") and opp_eff_ability == "hypercutter":
+                                        continue
+                                    if mid in ("screech", "leer", "tailwhip") and opp_eff_ability == "bigpecks":
+                                        continue
                                 slot_candidates.append(
                                     (55.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=target_index, mega=False))
                                 )
@@ -712,15 +968,36 @@ class LookaheadSearch:
 
         # 3. Switches to bench
         if not state.is_pokemon_trapped(active_pokemon):
+            opp_punishes_intimidate = any(
+                opp and not opp.fainted and opp.ability in ("defiant", "competitive", "contrary", "guarddog")
+                for opp in opponent_pokemon_list
+            )
             for bench_index, bench_pokemon in enumerate(bench_pokemon_list):
                 if bench_pokemon and not bench_pokemon.fainted:
                     switch_score = 65.0
                     if bench_pokemon.ability == "intimidate":
-                        switch_score += 15.0
+                        switch_score += -10.0 if opp_punishes_intimidate else 15.0
                     for opponent_pokemon in opponent_pokemon_list:
                         if opponent_pokemon and not opponent_pokemon.fainted:
                             for opponent_type in opponent_pokemon.types:
-                                if bench_pokemon.damage_multiplier(opponent_type) < 1.0:
+                                eff_mult = bench_pokemon.damage_multiplier(opponent_type)
+                                if bench_pokemon.ability == "thickfat" and opponent_type in ("fire", "ice"):
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability in ("heatproof", "waterbubble") and opponent_type == "fire":
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability == "purifyingsalt" and opponent_type == "ghost":
+                                    eff_mult *= 0.5
+                                elif bench_pokemon.ability in ("levitate", "eelevate", "eartheater") and opponent_type == "ground":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("flashfire", "wellbakedbody") and opponent_type == "fire":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("waterabsorb", "stormdrain", "dryskin") and opponent_type == "water":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability in ("voltabsorb", "lightningrod", "motordrive") and opponent_type == "electric":
+                                    eff_mult = 0.0
+                                elif bench_pokemon.ability == "sapsipper" and opponent_type == "grass":
+                                    eff_mult = 0.0
+                                if eff_mult < 1.0:
                                     switch_score += 5.0
                     slot_candidates.append(
                         (switch_score, SimulatedAction("switch", slot=slot, switch_idx=bench_index))
@@ -762,13 +1039,17 @@ class LookaheadSearch:
                 )
 
             scored_candidates: list[tuple[float, tuple[SimulatedAction, SimulatedAction]]] = []
-            dummy_opp: tuple[SimulatedAction, SimulatedAction] = (SimulatedAction("pass", slot=0), SimulatedAction("pass", slot=1))
-            for action in candidates:
-                next_battle_state = step_simulation(state, action, dummy_opp)
-                state_value = self.evaluator.evaluate(next_battle_state)
-                scored_candidates.append((state_value, action))
-
+            dummy_opp = (SimulatedAction("pass", slot=0), SimulatedAction("pass", slot=1))
+            next_states = [step_simulation(state, action, dummy_opp) for action in candidates]
+            
+            values_tensor = self.evaluator.evaluate(next_states)
+            values_np = values_tensor.detach().cpu().numpy()
+            
+            scored_candidates = [
+                (float(value), action) for value, action in zip(values_np, candidates)
+            ]
             scored_candidates.sort(key=lambda item: item[0], reverse=True)
+            
             best_value, best_action = scored_candidates[0]
             distribution: dict[tuple[SimulatedAction, SimulatedAction], float] = {action: (1.0 if action == best_action else 0.0) for _, action in scored_candidates}
             return SearchResult(
@@ -814,11 +1095,11 @@ class LookaheadSearch:
         """Recursive Simultaneous Minimax with Nash Equilibrium matrix solving."""
         if depth <= 0 or state.is_finished():
             self.nodes_evaluated += 1
-            leaf_value = self.evaluator.evaluate(state)
+            leaf_value = self.evaluator.evaluate(state).item()
             return leaf_value, None, {}, {}
 
         # Use neural policy prior at root to guide action exploration; optimize branching factor at depth
-        current_candidate_limit = self.max_candidates if depth == self.depth else min(6, self.max_candidates)
+        current_candidate_limit = self.max_candidates if depth == self.depth else min(9, self.max_candidates)
         candidates_player1 = self.generate_candidate_actions(
             state, side=1, max_candidates=current_candidate_limit, policy_prior=policy_prior if depth == self.depth else None
         )
@@ -829,7 +1110,7 @@ class LookaheadSearch:
         if not candidates_player1:
             self.nodes_evaluated += 1
             fallback: tuple[SimulatedAction, SimulatedAction] = (SimulatedAction("pass", slot=0), SimulatedAction("pass", slot=1))
-            return self.evaluator.evaluate(state), fallback, {fallback: 1.0}, {}
+            return self.evaluator.evaluate(state).item(), fallback, {fallback: 1.0}, {}
 
         if not candidates_player2:
             self.nodes_evaluated += len(candidates_player1)
@@ -840,7 +1121,7 @@ class LookaheadSearch:
             
             for action in candidates_player1:
                 next_state = step_simulation(state, action, opp_pass)
-                value = self.evaluator.evaluate(next_state)
+                value = self.evaluator.evaluate(next_state).item()
                 if value > best_value:
                     best_value = value
                     best_action = action
@@ -850,17 +1131,42 @@ class LookaheadSearch:
         num_player1_actions = len(candidates_player1)
         num_player2_actions = len(candidates_player2)
         payoff_matrix = np.zeros((num_player1_actions, num_player2_actions), dtype=np.float64)
+        # leaf_state_indices needed to map back the evaluated leaf values to the correct indices in the payoff matrix
+        # because we skip evaluating terminal states
+        leaf_states_to_evaluate: list[SimulatedBattleState] = []
+        leaf_state_indices: list[tuple[int, int]] = []
 
         for index_player1, action_player1 in enumerate(candidates_player1):
             for index_player2, action_player2 in enumerate(candidates_player2):
                 next_battle_state = step_simulation(state, action_player1, action_player2)
                 if depth - 1 == 0 or next_battle_state.is_finished():
-                    self.nodes_evaluated += 1
-                    payoff_matrix[index_player1, index_player2] = self.evaluator.evaluate(next_battle_state)
+                    is_neural = hasattr(self.evaluator, "evaluate_batch")
+                    win_val = 1.0 if is_neural else 100000.0
+                    turn_factor = 0.002 if is_neural else 10.0
+                    # If the next state is terminal, assign a large positive or negative value based on the winner
+                    # instead of evaluating the neural network, to avoid mistakes
+                    winner = next_battle_state.winner()
+                    if winner == 1:
+                        # Guaranteed win strictly beats any non-terminal state (+1.0), with small tie-breaker for faster wins
+                        payoff_matrix[index_player1, index_player2] = win_val + max(0.0, 0.1 - (next_battle_state.turn * turn_factor))
+                    elif winner == 2:
+                        payoff_matrix[index_player1, index_player2] = -win_val - max(0.0, 0.1 - (next_battle_state.turn * turn_factor))
+                    elif winner == 0:
+                        payoff_matrix[index_player1, index_player2] = 0.0
+                    else:
+                        leaf_states_to_evaluate.append(next_battle_state)
+                        leaf_state_indices.append((index_player1, index_player2))
                 else:
-                    # Recursive lookahead for deeper plies (depth 2 or 3)
-                    sub_value, _, _, _ = self._search_nash(next_battle_state, depth - 1)
+                    sub_value, _, _, _ = self._search_nash(next_battle_state, depth - 1, policy_prior=None)
                     payoff_matrix[index_player1, index_player2] = sub_value
+        
+        if leaf_states_to_evaluate:
+            self.nodes_evaluated += len(leaf_states_to_evaluate)
+            leaf_values = self.evaluator.evaluate(leaf_states_to_evaluate)
+            # move to CPU to avoid CUDA overhead
+            np_values = leaf_values.detach().cpu().numpy()
+            for (index_player1, index_player2), leaf_value in zip(leaf_state_indices, np_values):
+                payoff_matrix[index_player1, index_player2] = leaf_value.item()
 
         # Solve Nash equilibrium of payoff_matrix
         strategy_player1, strategy_player2, game_value = solve_zero_sum_matrix_game(payoff_matrix)
