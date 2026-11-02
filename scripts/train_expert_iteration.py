@@ -8,11 +8,9 @@ from __future__ import annotations
 import os
 import collections
 import uuid
-import re
 from typing import Optional
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
 from sb3_contrib import MaskablePPO
@@ -27,7 +25,6 @@ from src.evaluator import (
     CompetitiveHeuristicEvaluator,
     NeuralValueEvaluator,
     HybridEvaluator,
-    swap_tensor_observations,
 )
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch
@@ -58,7 +55,7 @@ class ExpertIterationTrainer:
         search_depth: int = 2,
         search_candidates_limit: int = 10,
         replay_buffer_capacity: int = 15000,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-5,
         batch_size: int = 64,
         policy_loss_weight: float = 1.0,
         value_loss_weight: float = 0.5,
@@ -78,12 +75,13 @@ class ExpertIterationTrainer:
             evaluator=HybridEvaluator(
                 model=model,
                 heuristic_evaluator=self.heuristic_evaluator,
-                neural_weight=0.1,
+                neural_weight=0.25,
             ),
             depth=search_depth,
             max_candidates=search_candidates_limit,
         )
         self.replay_buffer: collections.deque[Transition] = collections.deque(maxlen=replay_buffer_capacity)
+        self.validation_buffer: collections.deque[Transition] = collections.deque(maxlen=replay_buffer_capacity // 10)
         self.batch_size = batch_size
         self.policy_loss_weight = policy_loss_weight
         self.value_loss_weight = value_loss_weight
@@ -92,13 +90,16 @@ class ExpertIterationTrainer:
         self.best_model_directory = best_model_directory
         self.preview_model = preview_model
         self.device = device
+        self.best_eval_win_rate = 0.0
+        self.generator = np.random.default_rng()
+        self.target_neural_weight = 0.5
 
         os.makedirs(self.checkpoint_directory, exist_ok=True)
         os.makedirs(self.best_model_directory, exist_ok=True)
 
         if torch is not None and optim is not None:
-            self.optimizer = optim.Adam(self.model.policy.parameters(), lr=learning_rate)
-            self.preview_optimizer = optim.Adam(self.preview_model.parameters(), lr=1e-4)
+            self.optimizer = optim.Adam(self.model.policy.parameters(), lr=learning_rate, weight_decay=1e-4)
+            self.preview_optimizer = optim.Adam(self.preview_model.parameters(), lr=1e-4, weight_decay=1e-4)
         else:
             self.optimizer = None
             self.preview_optimizer = None
@@ -182,8 +183,8 @@ class ExpertIterationTrainer:
 
             # Compute immediate board heuristic value in [-1, 1] and blend with 2-turn lookahead search value
             # so intermediate states preserve exact sensitivity to current material, HP%, speed control, and boosts
-            current_heur_norm = float(torch.tanh(self.heuristic_evaluator.evaluate(simulated_state) / 8000.0).item())
-            local_board_value = float(np.clip(0.50 * float(search_result.value) + 0.50 * current_heur_norm, -1.0, 1.0))
+            # current_heur_norm = float(torch.tanh(self.heuristic_evaluator.evaluate(simulated_state) / 8000.0).item())
+            local_board_value = float(np.clip(float(search_result.value), -1.0, 1.0))
 
             # Record transition for this turn
             episode_transitions.append((observation, current_action_mask, target_policy_distribution, local_board_value))
@@ -246,18 +247,23 @@ class ExpertIterationTrainer:
         preview_loss.backward()
         self.preview_optimizer.step()
         
-        # Turn-discounted blending: final game outcome carries weight near the end of the battle,
-        # while earlier turns stay anchored to their tactical + 2-turn lookahead board value (local_value).
-        num_steps = len(episode_transitions)
-        GAMMA_OUTCOME = 0.85
-        MAX_OUTCOME_WEIGHT = 0.45
+        if isinstance(self.searcher.evaluator, HybridEvaluator) and self.searcher.evaluator.neural_weight < 1.0:
+            self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
+            self.searcher.evaluator.neural_weight = float(np.clip(self.searcher.evaluator.neural_weight, 0.0, 1.0))
+        
+        # Constant outcome anchoring: every turn's value target mixes the 2-turn lookahead search value
+        # with the actual game outcome at a fixed weight. The outcome is the only signal independent of
+        # both the heuristic and the network itself, which prevents self-referential value drift.
+        # Truncated / undecided games carry no outcome information, so they fall back to pure search value.
+        OUTCOME_WEIGHT = 0.5
+        outcome_weight = OUTCOME_WEIGHT if (battle.won or battle.lost) else 0.0
+        is_validation_episode = np.random.rand() < 0.1  # 10% of episodes are reserved for validation buffer
+        destination_buffer = self.validation_buffer if is_validation_episode else self.replay_buffer
 
-        # Store transitions with turn-discounted blended value targets into the replay buffer
-        for step_idx, (transition_observation, transition_mask, transition_target_policy, local_value) in enumerate(episode_transitions):
-            steps_from_end = (num_steps - 1) - step_idx
-            outcome_weight = MAX_OUTCOME_WEIGHT * (GAMMA_OUTCOME ** steps_from_end)
+        # Store transitions with outcome-anchored value targets into the replay buffer
+        for transition_observation, transition_mask, transition_target_policy, local_value in episode_transitions:
             blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
-            self.replay_buffer.append(
+            destination_buffer.append(
                 Transition(
                     observation=transition_observation,
                     action_mask=transition_mask,
@@ -281,7 +287,7 @@ class ExpertIterationTrainer:
         if len(self.replay_buffer) < self.batch_size:
             return 0.0, 0.0, 0.0
 
-        sample_indices = np.random.choice(len(self.replay_buffer), size=self.batch_size, replace=False)
+        sample_indices = self.generator.choice(len(self.replay_buffer), size=self.batch_size, replace=False)
         sampled_batch = [self.replay_buffer[index] for index in sample_indices]
 
         # Collate observations dictionary
@@ -329,15 +335,9 @@ class ExpertIterationTrainer:
         # Cross-Entropy Policy Loss: trains the network to output the search distribution
         policy_loss = -(target_policies_tensor * log_probabilities).sum(dim=-1).mean()
 
-        # Mean Squared Error Value Loss with Zero-Sum Swapped-Perspective Augmentation:
-        # Trains V(S) -> target_value AND V(swap(S)) -> -target_value to eliminate side bias
+        # Mean Squared Error Value Loss: trains critic V(S) -> target_value
         predicted_values = self.model.policy.predict_values(observation_tensors)  # Shape: (batch_size, 1)
-        swapped_observation_tensors = swap_tensor_observations(observation_tensors)
-        predicted_swapped_values = self.model.policy.predict_values(swapped_observation_tensors)  # Shape: (batch_size, 1)
-        value_loss = 0.25 * (
-            torch.nn.functional.mse_loss(predicted_values, target_values_tensor)
-            + torch.nn.functional.mse_loss(predicted_swapped_values, -target_values_tensor)
-        )
+        value_loss = 0.5 * torch.nn.functional.mse_loss(predicted_values, target_values_tensor)
 
         # Policy Entropy Regularization: prevents mode collapse onto deterministic single actions
         probabilities = torch.softmax(predicted_logits, dim=-1)
@@ -357,7 +357,49 @@ class ExpertIterationTrainer:
 
         return float(total_loss.item()), float(policy_loss.item()), float(value_loss.item())
 
-    def evaluate_benchmark(self, n_episodes: int = 5) -> tuple[float, float, float]:
+    def compute_validation_loss(self, n_samples: int = 128) -> float:
+        if len(self.validation_buffer) < n_samples:
+            return float('inf')
+
+        sample_size = min(n_samples, len(self.validation_buffer))
+        # Sample from the validation buffer
+        batch_idx = self.generator.choice(len(self.validation_buffer), sample_size, replace=False)
+        batch = [self.validation_buffer[idx] for idx in batch_idx]
+        
+        obs_numeric = torch.as_tensor(
+            np.array([transition.observation["numeric"] for transition in batch]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        obs_abilities = torch.as_tensor(
+            np.array([transition.observation["abilities"] for transition in batch]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        obs_items = torch.as_tensor(
+            np.array([transition.observation["items"] for transition in batch]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        target_values = torch.as_tensor(
+            np.array([transition.target_value for transition in batch]),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(-1)
+        
+        obs_tensors = {
+            "numeric": obs_numeric,
+            "abilities": obs_abilities,
+            "items": obs_items,
+        }
+        
+        with torch.no_grad():
+            predicted_values = self.model.policy.predict_values(obs_tensors)
+            validation_loss = 0.5 * torch.nn.functional.mse_loss(predicted_values, target_values)
+        
+        return float(validation_loss.item())
+
+    def evaluate_benchmark(self, n_episodes: int = 25) -> tuple[float, float, float]:
         """
         Evaluates current neural network policy against benchmark environment (SimpleHeuristicsPlayer)
         in pure greedy deterministic mode (0 exploration noise).
@@ -369,6 +411,14 @@ class ExpertIterationTrainer:
         wins = 0
         rewards: list[float] = []
         turns: list[int] = []
+        eval_searcher = LookaheadSearch(
+            model=self.model,
+            evaluator=NeuralValueEvaluator(
+                model=self.model,
+            ),
+        )
+        results_by_opp_archetype: dict[str, list[float]] = collections.defaultdict(list)
+        results_by_own_archetype: dict[str, list[float]] = collections.defaultdict(list)
 
         for _ in range(n_episodes):
             observation, _ = self.eval_environment.reset()
@@ -378,20 +428,26 @@ class ExpertIterationTrainer:
             turn_count = 0
 
             while not (is_terminated or is_truncated):
+                current_battle = self.eval_environment.current_battle
                 current_action_mask = self.eval_environment.action_masks()
                 tensor_obs, _ = self.model.policy.obs_to_tensor(observation)
+                simulated_battle_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
                 with torch.no_grad():
                     distribution = self.model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
                     if isinstance(distribution, MaskableCategoricalDistribution):
                         policy_probs = distribution.distribution.probs.squeeze(0).cpu().numpy()
+                        policy_probs = np.where(current_action_mask, policy_probs, 0.0)  # Mask illegal actions
                     else:
                         policy_probs = np.ones(676, dtype=np.float32)
 
-                legal_indices = np.where(current_action_mask)[0]
-                if len(legal_indices) > 0:
-                    chosen_action = int(legal_indices[np.argmax(policy_probs[legal_indices])])
-                else:
-                    chosen_action = 0
+                # legal_indices = np.where(current_action_mask)[0]
+                # if len(legal_indices) > 0:
+                #     chosen_action = int(legal_indices[np.argmax(policy_probs[legal_indices])])
+                # else:
+                #     chosen_action = 0
+                
+                search_result = eval_searcher.search(simulated_battle_state, policy_prior=policy_probs)
+                chosen_action = int(min(675, max(0, eval_searcher.to_env_action(search_result.best_action, current_battle))))
 
                 observation, step_reward, is_terminated, is_truncated, _ = self.eval_environment.step(chosen_action)
                 cumulative_reward += float(step_reward)
@@ -402,16 +458,36 @@ class ExpertIterationTrainer:
             rewards.append(cumulative_reward)
             turns.append(turn_count)
 
+            # Record win rates by opponent and own archetype
+            agent_team, opp_team = self.eval_environment.agent_team, self.eval_environment.opponent_team
+            opp_archetypes = opp_team.archetypes if opp_team else ["Unknown"]
+            own_archetypes = agent_team.archetypes if agent_team else ["Unknown"]
+            for archetype in opp_archetypes:
+                results_by_opp_archetype[archetype].append(1.0 if cumulative_reward > 0 else 0.0)
+            for archetype in own_archetypes:
+                results_by_own_archetype[archetype].append(1.0 if cumulative_reward > 0 else 0.0)
+
         win_rate = wins / max(1, n_episodes)
         mean_reward = float(np.mean(rewards)) if rewards else 0.0
         mean_turns = float(np.mean(turns)) if turns else 0.0
+        
+        win_rate_by_opp_archetype = {archetype: np.mean(results) for archetype, results in results_by_opp_archetype.items()}
+        win_rate_by_own_archetype = {archetype: np.mean(results) for archetype, results in results_by_own_archetype.items()}
+        
+        if min(win_rate_by_opp_archetype.values()) >= 0.8 and min(win_rate_by_own_archetype.values()) >= 0.8:
+            self.target_neural_weight = min(1.0, self.target_neural_weight + 0.25)
+        
+        print(f"    Archetypes (Own): {win_rate_by_own_archetype}")
+        print(f"    Archetypes (Opp): {win_rate_by_opp_archetype}")
+        print(f"Total Win Rate: {win_rate * 100:.1f}% | Avg Turns: {mean_turns:.1f} | Avg Reward: {mean_reward:+.2f}\n")
+        
         return win_rate, mean_reward, mean_turns
 
     def learn(
         self,
         total_episodes: int = 1000,
-        training_steps_per_episode: int = 8,
-        checkpoint_frequency: int = 25,
+        training_steps_per_episode: int = 2,
+        checkpoint_frequency: int = 50,
         start_episode: int = 1,
     ) -> "ExpertIterationTrainer":
         """Runs the complete self-play and training loop (AlphaZero / Expert Iteration).
@@ -430,13 +506,14 @@ class ExpertIterationTrainer:
     def run_training_loop(
         self,
         total_episodes: int = 1000,
-        training_steps_per_episode: int = 8,
-        checkpoint_frequency: int = 25,
+        training_steps_per_episode: int = 2,
+        checkpoint_frequency: int = 50,
         start_episode: int = 1,
     ) -> None:
         """Runs the complete self-play and training loop."""
         print(f"Starting Expert Iteration Training from Episode {start_episode} to {total_episodes} on device: {self.device}")
         print(f"Lookahead Engine: 2-Turn Nash Equilibrium (Simultaneous Matrix Solver)")
+        
         recent_rewards: collections.deque[float] = collections.deque(maxlen=50)
 
         for episode_index in range(start_episode, total_episodes + 1):
@@ -445,11 +522,15 @@ class ExpertIterationTrainer:
 
             # Train the network on accumulated lookahead search data
             total_loss, policy_loss, value_loss = 0.0, 0.0, 0.0
-            for _ in range(training_steps_per_episode):
-                step_total, step_pol, step_val = self.train_step()
-                total_loss += step_total
-                policy_loss += step_pol
-                value_loss += step_val
+            if len(self.replay_buffer) > 1000:
+                for _ in range(training_steps_per_episode):
+                    step_total, step_pol, step_val = self.train_step()
+                    total_loss += step_total
+                    policy_loss += step_pol
+                    value_loss += step_val
+            else:
+                if episode_index % 5 == 0 or episode_index == start_episode:
+                    print(f"Episode {episode_index}: Not enough data in replay buffer ({len(self.replay_buffer)}) to train.")
 
             average_total_loss = total_loss / max(1, training_steps_per_episode)
             average_policy_loss = policy_loss / max(1, training_steps_per_episode)
@@ -464,37 +545,38 @@ class ExpertIterationTrainer:
                     f"WinRate(last 50): {win_rate * 100:.1f}% | "
                     f"Buffer: {len(self.replay_buffer):5d} | "
                     f"PolicyLoss: {average_policy_loss:.4f} | "
-                    f"ValueLoss: {average_value_loss:.4f}"
+                    f"ValueLoss: {average_value_loss:.4f} | "
+                    f"ValidationLoss: {self.compute_validation_loss():.4f}"
                 )
 
             # Checkpoint saving & benchmark validation
-            if episode_index % checkpoint_frequency == 0 or episode_index == total_episodes:
-                checkpoint_path = os.path.join(
-                    self.checkpoint_directory, f"expert_iteration_model_{episode_index}_episodes.zip"
-                )
-                self.model.save(checkpoint_path)
-                print(f"Saved checkpoint to {checkpoint_path}")
+            if episode_index % checkpoint_frequency == 0 or episode_index == total_episodes or episode_index == start_episode:
+                # checkpoint_path = os.path.join(
+                #     self.checkpoint_directory, f"expert_iteration_model_{episode_index}_episodes.zip"
+                # )
+                # self.model.save(checkpoint_path)
+                # print(f"Saved checkpoint to {checkpoint_path}")
 
                 # Save as current best model
                 best_model_path = os.path.join(self.best_model_directory, "best_model.zip")
-                self.model.save(best_model_path)
-                print(f"Updated best model at {best_model_path}")
 
-                preview_checkpoint_path = os.path.join(
-                    self.checkpoint_directory, f"team_preview_model_{episode_index}_episodes.pt"
-                )
-                torch.save(self.preview_model.state_dict(), preview_checkpoint_path)
+                # preview_checkpoint_path = os.path.join(
+                #     self.checkpoint_directory, f"team_preview_model_{episode_index}_episodes.pt"
+                # )
+                # torch.save(self.preview_model.state_dict(), preview_checkpoint_path)
                 
                 best_preview_path = os.path.join(self.best_model_directory, "best_team_preview_model.pt")
-                torch.save(self.preview_model.state_dict(), best_preview_path)
                 
                 # Periodic Benchmark Evaluation against SimpleHeuristics baseline
                 if self.eval_environment is not None:
-                    eval_win_rate, eval_reward, eval_turns = self.evaluate_benchmark(n_episodes=5)
-                    print(
-                        f"\n>>> [Benchmark Eval @ Ep {episode_index}] vs SimpleHeuristics: "
-                        f"Win Rate: {eval_win_rate * 100:.1f}% | Avg Turns: {eval_turns:.1f} | Avg Reward: {eval_reward:+.2f}\n"
-                    )
+                    print(f"\n>>> [Benchmark Eval @ Ep {episode_index}] vs SimpleHeuristics: ")
+                    eval_win_rate, _, _ = self.evaluate_benchmark(n_episodes=25)
+                    self.best_eval_win_rate = eval_win_rate if episode_index == start_episode else self.best_eval_win_rate
+                    if eval_win_rate > self.best_eval_win_rate:
+                        self.best_eval_win_rate = eval_win_rate
+                        self.model.save(best_model_path)
+                        torch.save(self.preview_model.state_dict(), best_preview_path)
+                        print(f"New best evaluation model saved at {best_model_path} with Win Rate: {eval_win_rate * 100:.1f}%")
 
 def main():
     team_file_path = os.path.join(os.path.dirname(__file__), "..", "teams", "MC646.txt")
@@ -550,7 +632,7 @@ def main():
         policy_arguments = dict(
             features_extractor_class=VGCFeatureExtractor,
             features_extractor_kwargs=dict(ability_dim=32, item_dim=32),
-            net_arch=dict(pi=[512, 256], vf=[512, 256]),
+            net_arch=dict(pi=[1024, 512, 256], vf=[1024, 512, 256]),
         )
         ppo_model = MaskablePPO(
             MaskableMultiInputActorCriticPolicy,
@@ -569,7 +651,7 @@ def main():
         search_depth=2,
         search_candidates_limit=9,
         replay_buffer_capacity=100000,
-        learning_rate=1e-4,
+        learning_rate=3e-5,
         batch_size=64,
         policy_loss_weight=1.0,
         value_loss_weight=0.5,
@@ -586,8 +668,8 @@ def main():
 
     trainer.learn(
         total_episodes=15000,
-        training_steps_per_episode=8,
-        checkpoint_frequency=25,
+        training_steps_per_episode=2,
+        checkpoint_frequency=50,
         start_episode=start_episode,
     )
 

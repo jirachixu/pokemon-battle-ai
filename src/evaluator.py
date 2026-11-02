@@ -41,7 +41,7 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         weight_win_loss: float = 100000.0,
         weight_alive_differential: float = 2500.0,
         weight_hp_differential: float = 1500.0,
-        weight_speed_control: float = 350.0,
+        weight_speed_control: float = 750.0,
         weight_stat_boosts: float = 250.0,
         weight_status_penalty: float = 350.0,
         weight_threat_pressure: float = 500.0,
@@ -120,14 +120,15 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
                 min_team_speed = min(team_effective_speeds)
                 min_opp_speed = min(opp_effective_speeds)
                 if min_team_speed < min_opp_speed:
-                    evaluation_score += self.weight_speed_control * 0.8
+                    evaluation_score += self.weight_speed_control
                 else:
-                    evaluation_score -= self.weight_speed_control * 0.8
+                    evaluation_score -= self.weight_speed_control
             else:
-                if max_team_speed > max_opp_speed:
-                    evaluation_score += self.weight_speed_control * 0.8
-                else:
-                    evaluation_score -= self.weight_speed_control * 0.8
+                if team_tailwind_turns == 0 and opp_tailwind_turns == 0:
+                    if max_team_speed > max_opp_speed:
+                        evaluation_score += self.weight_speed_control
+                    else:
+                        evaluation_score -= self.weight_speed_control
 
         # 4. Stat Boosts Advantage
         for pokemon in state.all_team_pokemon():
@@ -482,50 +483,15 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
 
         return penalty
     
-_NUMERIC_SWAP_INDICES: Optional[torch.Tensor] = None
-_SLOT_SWAP_INDICES = [2, 3, 0, 1, 6, 7, 4, 5]
-
-
-def get_numeric_swap_indices(device: torch.device | str = "cpu") -> torch.Tensor:
-    """Returns the 1187-element index permutation that swaps Side 1 and Side 2 in numeric observations."""
-    global _NUMERIC_SWAP_INDICES
-    if _NUMERIC_SWAP_INDICES is None:
-        idx = list(range(10))                      # [0:10] weather (5) + terrain (5)
-        idx += [13, 14, 15, 10, 11, 12]            # [10:16] swap own screens <-> opp screens
-        idx += [16, 18, 17]                        # [16:19] trick room + swap own tailwind <-> opp tailwind
-        idx += list(range(311, 603))               # [19:311] <- opp_active_pokemon [311:603]
-        idx += list(range(19, 311))                # [311:603] <- own_active_pokemon [19:311]
-        idx += list(range(895, 1187))              # [603:895] <- opp_bench [895:1187]
-        idx += list(range(603, 895))               # [895:1187] <- own_bench [603:895]
-        _NUMERIC_SWAP_INDICES = torch.tensor(idx, dtype=torch.long)
-    return _NUMERIC_SWAP_INDICES.to(device)
-
-
-def swap_tensor_observations(tensor_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """
-    Swaps Side 1 and Side 2 perspectives in a batched observation tensor dict
-    ({"numeric": (B, 1187), "abilities": (B, 8, 215), "items": (B, 8, 167)}).
-    """
-    num_tensor = tensor_obs["numeric"]
-    swap_idx = get_numeric_swap_indices(num_tensor.device)
-    return {
-        "numeric": num_tensor.index_select(-1, swap_idx),
-        "abilities": tensor_obs["abilities"][..., _SLOT_SWAP_INDICES, :],
-        "items": tensor_obs["items"][..., _SLOT_SWAP_INDICES, :],
-    }
-
-
 class NeuralValueEvaluator(BattleStateEvaluator):
     """
     Evaluator that queries the trained neural network value head (critic) from Stable-Baselines3
     or a PyTorch actor-critic network to evaluate leaf board states.
-    Enforces zero-sum side anti-symmetry: V_sym(S) = 0.5 * (V(S) - V(swap(S))).
     """
-    def __init__(self, model: Any, state_encoder: Optional[StateEncoder] = None, symmetric: bool = True):
+    def __init__(self, model: Any, state_encoder: Optional[StateEncoder] = None):
         self.model = model
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.state_encoder = state_encoder if state_encoder is not None else StateEncoder()
-        self.symmetric = symmetric
 
     def evaluate_batch(self, states: List[SimulatedBattleState]) -> torch.Tensor:
         """
@@ -544,19 +510,7 @@ class NeuralValueEvaluator(BattleStateEvaluator):
             }
             tensor_obs, _ = self.model.policy.obs_to_tensor(batched_np)
             with torch.no_grad():
-                if self.symmetric:
-                    swapped_obs = swap_tensor_observations(tensor_obs)
-                    combined_obs = {
-                        k: torch.cat([tensor_obs[k], swapped_obs[k]], dim=0)
-                        for k in tensor_obs
-                    }
-                    combined_values = self.model.policy.predict_values(combined_obs).view(-1)
-                    batch_len = len(states)
-                    v_forward = combined_values[:batch_len]
-                    v_swapped = combined_values[batch_len:]
-                    value_tensor = 0.5 * (v_forward - v_swapped)
-                else:
-                    value_tensor = self.model.policy.predict_values(tensor_obs).view(-1)
+                value_tensor = self.model.policy.predict_values(tensor_obs).view(-1)
                 return torch.clamp(value_tensor, -1.0, 1.0)
         return torch.zeros(len(states), device=self.device)
     

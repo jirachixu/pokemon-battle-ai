@@ -238,7 +238,7 @@ class VGCEnv(gym.Env):
         self.opponent = opponent if opponent is not None else RandomPlayer(battle_format=self.battle_format)
         self.state_encoder = StateEncoder()
         self.observation_space = spaces.Dict({
-            "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1187,), dtype=np.float32),
+            "numeric": spaces.Box(low=-1.0, high=1.0, shape=(1183,), dtype=np.float32),
             "abilities": spaces.Box(low=0.0, high=1.0, shape=(8, 215), dtype=np.float32),
             "items": spaces.Box(low=0.0, high=1.0, shape=(8, 167), dtype=np.float32),
         })

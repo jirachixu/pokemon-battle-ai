@@ -147,36 +147,24 @@ class StateEncoder:
         Returns:
             torch.Tensor: A tensor representing the encoded screen conditions for both players.
         """
-        # [reflect, light_screen, aurora_veil, opponent_reflect, opponent_light_screen, opponent_aurora_veil]
-        screens_tensor = torch.zeros(6, dtype=torch.float32)
+        # [net_reflect, net_light_screen, net_aurora_veil]
+        screens_tensor = torch.zeros(3, dtype=torch.float32)
         side_conds = {clean_str(c): turn for c, turn in getattr(battle, "side_conditions", {}).items()}
         opponent_side_conds = {clean_str(c): turn for c, turn in getattr(battle, "opponent_side_conditions", {}).items()}
         current_turn = getattr(battle, "turn", 0)
         is_sim = isinstance(battle, SimulatedBattleState)
 
-        if "reflect" in side_conds:
-            start_turn = side_conds["reflect"]
-            screens_tensor[0] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
+        own_ref = self._calc_turns_remaining(side_conds["reflect"], current_turn, 5, is_simulated=is_sim) if "reflect" in side_conds else 0.0
+        own_ls = self._calc_turns_remaining(side_conds["lightscreen"], current_turn, 5, is_simulated=is_sim) if "lightscreen" in side_conds else 0.0
+        own_av = self._calc_turns_remaining(side_conds["auroraveil"], current_turn, 5, is_simulated=is_sim) if "auroraveil" in side_conds else 0.0
 
-        if "lightscreen" in side_conds:
-            start_turn = side_conds["lightscreen"]
-            screens_tensor[1] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
+        opp_ref = self._calc_turns_remaining(opponent_side_conds["reflect"], current_turn, 5, is_simulated=is_sim) if "reflect" in opponent_side_conds else 0.0
+        opp_ls = self._calc_turns_remaining(opponent_side_conds["lightscreen"], current_turn, 5, is_simulated=is_sim) if "lightscreen" in opponent_side_conds else 0.0
+        opp_av = self._calc_turns_remaining(opponent_side_conds["auroraveil"], current_turn, 5, is_simulated=is_sim) if "auroraveil" in opponent_side_conds else 0.0
 
-        if "auroraveil" in side_conds:
-            start_turn = side_conds["auroraveil"]
-            screens_tensor[2] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
-
-        if "reflect" in opponent_side_conds:
-            start_turn = opponent_side_conds["reflect"]
-            screens_tensor[3] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
-
-        if "lightscreen" in opponent_side_conds:
-            start_turn = opponent_side_conds["lightscreen"]
-            screens_tensor[4] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
-
-        if "auroraveil" in opponent_side_conds:
-            start_turn = opponent_side_conds["auroraveil"]
-            screens_tensor[5] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
+        screens_tensor[0] = own_ref - opp_ref
+        screens_tensor[1] = own_ls - opp_ls
+        screens_tensor[2] = own_av - opp_av
 
         return screens_tensor
 
@@ -188,8 +176,8 @@ class StateEncoder:
         Returns:
             torch.Tensor: A tensor representing the encoded speed modifiers for both players' active Pokémon.
         """
-        # [trick_room_active, tailwind_active, opponent_tailwind_active]
-        speed_modifiers_tensor = torch.zeros(3, dtype=torch.float32)
+        # [trick_room_active, net_tailwind]
+        speed_modifiers_tensor = torch.zeros(2, dtype=torch.float32)
         active_fields = {clean_str(f): turn for f, turn in getattr(battle, "fields", {}).items()}
         current_turn = getattr(battle, "turn", 0)
         is_sim = isinstance(battle, SimulatedBattleState)
@@ -198,14 +186,18 @@ class StateEncoder:
             speed_modifiers_tensor[0] = self._calc_turns_remaining(start_turn, current_turn, 5, is_simulated=is_sim)
 
         side_conds = {clean_str(c): turn for c, turn in getattr(battle, "side_conditions", {}).items()}
+        own_tw = 0.0
         if "tailwind" in side_conds:
             start_turn = side_conds["tailwind"]
-            speed_modifiers_tensor[1] = self._calc_turns_remaining(start_turn, current_turn, 4, is_simulated=is_sim)
+            own_tw = self._calc_turns_remaining(start_turn, current_turn, 4, is_simulated=is_sim)
 
         opp_side_conds = {clean_str(c): turn for c, turn in getattr(battle, "opponent_side_conditions", {}).items()}
+        opp_tw = 0.0
         if "tailwind" in opp_side_conds:
             start_turn = opp_side_conds["tailwind"]
-            speed_modifiers_tensor[2] = self._calc_turns_remaining(start_turn, current_turn, 4, is_simulated=is_sim)
+            opp_tw = self._calc_turns_remaining(start_turn, current_turn, 4, is_simulated=is_sim)
+
+        speed_modifiers_tensor[1] = own_tw - opp_tw
 
         return speed_modifiers_tensor
 
