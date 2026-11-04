@@ -14,6 +14,7 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import time
 import signal
+import gc
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
@@ -185,7 +186,7 @@ def evaluate_neural_lookahead(
         arch: {"wins": 0, "losses": 0, "total": 0} for arch in ALL_ARCHETYPES
     }
     
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=context) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=context, max_tasks_per_child=1) as executor:
         try:
             futures = []
             for _ in range(n_eval_episodes):
@@ -264,6 +265,10 @@ def evaluate_neural_lookahead(
                     print(f"Error while terminating workers: {e}")
             executor.shutdown(wait=False, cancel_futures=True)
             raise
+    
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     final_win_rate = (wins / max(1, n_eval_episodes)) * 100.0
     final_mean_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0

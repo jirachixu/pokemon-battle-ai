@@ -8,6 +8,7 @@ import numpy as np
 from typing import Any, Optional
 import queue
 import asyncio
+import logging
 
 from src.state_encoder import StateEncoder
 from src.simulation import SimulatedBattleState
@@ -442,5 +443,40 @@ class VGCEnv(gym.Env):
         """
         Close the environment and clean up resources.
         """
-        # Do nothing as Python and the OS kernel will clean up the background thread and resources when the process exits.
-        pass
+        for player in [self.agent, self.opponent]:
+            if player is None:
+                continue
+            
+            # Close the active socket connection to Showdown if it exists so listen() can exit gracefully
+            ps_client = getattr(player, "ps_client", None)
+            if ps_client is not None:
+                if hasattr(ps_client, "websocket") and ps_client.websocket is not None:
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(ps_client._stop_listening(), ps_client.loop)
+                        future.result(timeout=2.0)
+                    except Exception as e:
+                        logging.error(f"Error occurred while stopping PS client: {e}")
+                
+                # Cancel any listening coroutines that may be running in the background thread of the PS client
+                listening_coroutine = getattr(ps_client, "_listening_coroutine", None)
+                if listening_coroutine is not None and not listening_coroutine.done():
+                    try:
+                        listening_coroutine.cancel()
+                    except Exception as e:
+                        logging.error(f"Error occurred while cancelling listening coroutines: {e}")
+                
+                # Clear the username logger for the PS client to avoid memory leaks
+                username = getattr(ps_client, "username", None)
+                if username:
+                    logger = logging.getLogger(username)
+                    logger.handlers.clear()
+                    logging.Logger.manager.loggerDict.pop(username, None)
+                    
+            # Clear cached battle objects and model references to free up memory
+            if hasattr(player, "_battles"):
+                player._battles.clear()
+            if hasattr(player, "team_preview_model"):
+                player.team_preview_model = None
+            if hasattr(player, "last_teampreview_observation"):
+                player.last_teampreview_observation = None
+                

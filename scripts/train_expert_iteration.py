@@ -16,6 +16,7 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import time
 import signal
+import gc
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
@@ -55,6 +56,7 @@ def _evaluate_single_validation_episode(
     model = MaskablePPO.load(model_path, device=device)
     preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device)
     preview_model.load_state_dict(torch.load(preview_model_path, map_location=device))
+    preview_model.eval()
     opponent = SimpleHeuristicsPlayer(
         battle_format="gen9championsvgc2026regmc",
         accept_open_team_sheet=True,
@@ -295,7 +297,6 @@ class ExpertIterationTrainer:
     def __init__(
         self,
         model: MaskablePPO,
-        training_environment: VGCEnv,
         preview_model: TeamPreviewModel,
         search_depth: int = 2,
         search_candidates_limit: int = 9,
@@ -308,12 +309,9 @@ class ExpertIterationTrainer:
         checkpoint_directory: str = "./checkpoints/expert_iteration/",
         best_model_directory: str = "./checkpoints/best_model/",
         device: str = "cuda" if (torch and torch.cuda.is_available()) else "cpu",
-        eval_environment: Optional[VGCEnv] = None,
         num_workers: int = 8,
     ):
         self.model = model
-        self.training_environment = training_environment
-        self.eval_environment = eval_environment
         self.search_depth = search_depth
         self.heuristic_evaluator = CompetitiveHeuristicEvaluator()
         self.searcher = LookaheadSearch(
@@ -346,7 +344,7 @@ class ExpertIterationTrainer:
 
         if torch is not None and optim is not None:
             self.optimizer = optim.Adam(self.model.policy.parameters(), lr=learning_rate, weight_decay=1e-4)
-            self.preview_optimizer = optim.Adam(self.preview_model.parameters(), lr=1e-4, weight_decay=1e-4)
+            self.preview_optimizer = optim.Adam(self.preview_model.parameters(), lr=learning_rate, weight_decay=1e-4)
         else:
             self.optimizer = None
             self.preview_optimizer = None
@@ -373,7 +371,7 @@ class ExpertIterationTrainer:
         if isinstance(self.searcher.evaluator, HybridEvaluator):
             current_neural_weight = self.searcher.evaluator.neural_weight
         
-        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
+        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context, max_tasks_per_child=1) as executor:
             try:
                 futures = []
                 for _ in range(self.num_workers):
@@ -450,6 +448,10 @@ class ExpertIterationTrainer:
                         print(f"Error terminating process {pid}: {e}")
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
+        
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return wins, episode_lengths
 
@@ -583,9 +585,6 @@ class ExpertIterationTrainer:
         in pure greedy deterministic mode (0 exploration noise).
         Returns (win_rate, mean_reward, mean_turns).
         """
-        if self.eval_environment is None:
-            return 0.0, 0.0, 0.0
-
         wins = 0
         rewards: list[float] = []
         turns: list[int] = []
@@ -596,7 +595,7 @@ class ExpertIterationTrainer:
         
         context = mp.get_context("spawn")  # Use 'spawn' to avoid issues with CUDA in child processes
 
-        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
+        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context, max_tasks_per_child=1) as executor:
             try:
                 futures = []
                 for _ in range(n_episodes):
@@ -630,6 +629,10 @@ class ExpertIterationTrainer:
                         print(f"Error terminating process {pid}: {e}")
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
+            
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if n_episodes == 0:
             return 0.0, 0.0, 0.0
@@ -648,17 +651,12 @@ class ExpertIterationTrainer:
         print(f"    Archetypes (Opp): {win_rate_by_opp_archetype}")
         print(f"Total Win Rate: {win_rate * 100:.1f}% | Avg Turns: {mean_turns:.1f} | Avg Reward: {mean_reward:+.2f}\n")
         
-        return (
-            win_rate,
-            mean_reward,
-            mean_turns
-        )
+        return (win_rate, mean_reward, mean_turns)
 
     def learn(
         self,
         total_episodes: int = 1000,
         training_steps_per_episode: int = 2,
-        checkpoint_frequency: int = 50,
         start_episode: int = 1,
     ) -> "ExpertIterationTrainer":
         """Runs the complete self-play and training loop (AlphaZero / Expert Iteration).
@@ -744,15 +742,14 @@ class ExpertIterationTrainer:
                 best_preview_path = os.path.join(self.best_model_directory, "best_team_preview_model.pt")
                 
                 # Periodic Benchmark Evaluation against SimpleHeuristics baseline
-                if self.eval_environment is not None:
-                    print(f"\n>>> [Benchmark Eval @ Ep {episode_index}] vs SimpleHeuristics: ")
-                    eval_win_rate, _, _ = self.evaluate_benchmark(n_episodes=100)
-                    self.best_eval_win_rate = eval_win_rate if episode_index == start_episode else self.best_eval_win_rate
-                    if eval_win_rate > self.best_eval_win_rate:
-                        self.best_eval_win_rate = eval_win_rate
-                        self.model.save(best_model_path)
-                        torch.save(self.preview_model.state_dict(), best_preview_path)
-                        print(f"New best evaluation model saved at {best_model_path} with Win Rate: {eval_win_rate * 100:.1f}%")
+                print(f"\n>>> [Benchmark Eval @ Ep {episode_index}] vs SimpleHeuristics: ")
+                eval_win_rate, _, _ = self.evaluate_benchmark(n_episodes=100)
+                self.best_eval_win_rate = eval_win_rate if episode_index == start_episode else self.best_eval_win_rate
+                if eval_win_rate > self.best_eval_win_rate:
+                    self.best_eval_win_rate = eval_win_rate
+                    self.model.save(best_model_path)
+                    torch.save(self.preview_model.state_dict(), best_preview_path)
+                    print(f"New best evaluation model saved at {best_model_path} with Win Rate: {eval_win_rate * 100:.1f}%")
 
 def main():
     team_file_path = os.path.join(os.path.dirname(__file__), "..", "teams", "MC646.txt")
@@ -791,15 +788,6 @@ def main():
     raw_environment.agent.update_team(team=team_paste)
     monitored_environment = Monitor(raw_environment)
 
-    eval_opponent = SimpleHeuristicsPlayer(
-        battle_format="gen9championsvgc2026regmc",
-        team=team_paste,
-        accept_open_team_sheet=True,
-        account_configuration=AccountConfiguration(f"Heuristic_{uuid.uuid4().hex[:6]}", None),
-    )
-    eval_environment = VGCEnv(opponent=eval_opponent)
-    eval_environment.agent.update_team(team=team_paste)
-
     if os.path.exists(best_checkpoint_path):
         print(f"Loading existing model from {best_checkpoint_path}...")
         ppo_model = MaskablePPO.load(best_checkpoint_path, env=monitored_environment, device=device_name)
@@ -821,12 +809,10 @@ def main():
 
     trainer = ExpertIterationTrainer(
         model=ppo_model,
-        training_environment=raw_environment,
         preview_model=preview_model,
-        eval_environment=eval_environment,
         search_depth=2,
         search_candidates_limit=9,
-        replay_buffer_capacity=100000,
+        replay_buffer_capacity=30000,
         learning_rate=3e-5,
         batch_size=64,
         policy_loss_weight=1.0,
@@ -837,15 +823,9 @@ def main():
         device=device_name,
     )
 
-    # Ensure that the agent shares the same team preview model as the trainer so it can be updated during training
-    # and used during evaluation
-    raw_environment.agent.team_preview_model = trainer.preview_model
-    eval_environment.agent.team_preview_model = trainer.preview_model
-
     trainer.learn(
         total_episodes=15000,
         training_steps_per_episode=2,
-        checkpoint_frequency=50,
         start_episode=start_episode,
     )
 

@@ -28,7 +28,7 @@ def _select_teampreview(
     assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
     observation = team_preview_encoder.encode(battle)
     device = next(team_preview_model.parameters()).device
-    cpu_observation = observation.copy()
+    cpu_observation = {key: value.cpu().numpy() for key, value in observation.items()}
     observation = {key: value.to(device) for key, value in observation.items()}
     
     # Generate all possible combinations of 4 Pokémon from the 6 brought to battle, 
