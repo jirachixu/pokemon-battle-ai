@@ -15,6 +15,7 @@ import torch.optim as optim
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import time
+import signal
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
@@ -373,72 +374,82 @@ class ExpertIterationTrainer:
             current_neural_weight = self.searcher.evaluator.neural_weight
         
         with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
-            futures = []
-            for _ in range(self.num_workers):
-                future = executor.submit(
-                    _collect_single_lookahead_episode,
-                    model_path=os.path.join(self.checkpoint_directory, "temp_ppo_model.zip"),
-                    preview_model_path=os.path.join(self.checkpoint_directory, "temp_preview_model.pt"),
-                    depth=depth,
-                    max_candidates=max_candidates,
-                    current_neural_weight=current_neural_weight,
-                )
-                futures.append(future)
-                time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
-
-            for future in futures:
-                result = future.result()
-                if result["win"]:
-                    wins += 1
-                episode_transitions = result["episode_transitions"]
-                shaped_outcome = result["shaped_outcome"]
-                outcome_weight = result["outcome_weight"]
-                preview_observation = result["preview_observation"]
-                preview_action = result["preview_action"]
-                
-                preview_observation_tensors = {
-                    key: value.to(self.device) if isinstance(value, torch.Tensor) 
-                    else torch.as_tensor(value, dtype=torch.float32, device=self.device)
-                    for key, value in preview_observation.items()
-                }
-                logits, preview_value = self.preview_model(preview_observation_tensors)
-                distribution = torch.distributions.Categorical(logits=logits)
-                action_tensor = torch.as_tensor(preview_action, device=self.device)
-                preview_log_probability = distribution.log_prob(action_tensor)
-                entropy = distribution.entropy()
-        
-                # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
-                # it will backprop through the policy loss part as well. This is for the preview model.
-                advantage = shaped_outcome - preview_value.item()
-                policy_loss = -preview_log_probability * advantage
-                value_loss = 0.5 * ((preview_value - shaped_outcome) ** 2)
-                entropy_loss = -0.01 * entropy
-                preview_loss = policy_loss + value_loss + entropy_loss
-                
-                self.preview_optimizer.zero_grad()
-                preview_loss.backward()
-                self.preview_optimizer.step()
-                
-                if isinstance(self.searcher.evaluator, HybridEvaluator):
-                    self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
-                    self.searcher.evaluator.neural_weight = float(np.clip(self.searcher.evaluator.neural_weight, 0.0, 1.0))
-
-                is_validation_episode = np.random.rand() < 0.1  # 10% of episodes are reserved for validation buffer
-                destination_buffer = self.validation_buffer if is_validation_episode else self.replay_buffer
-
-                # Store transitions with outcome-anchored value targets into the replay buffer
-                for transition_observation, transition_mask, transition_target_policy, local_value in episode_transitions:
-                    blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
-                    destination_buffer.append(
-                        Transition(
-                            observation=transition_observation,
-                            action_mask=transition_mask,
-                            target_policy=transition_target_policy,
-                            target_value=float(np.clip(blended_value_target, -1.0, 1.0)),
-                        )
+            try:
+                futures = []
+                for _ in range(self.num_workers):
+                    future = executor.submit(
+                        _collect_single_lookahead_episode,
+                        model_path=os.path.join(self.checkpoint_directory, "temp_ppo_model.zip"),
+                        preview_model_path=os.path.join(self.checkpoint_directory, "temp_preview_model.pt"),
+                        depth=depth,
+                        max_candidates=max_candidates,
+                        current_neural_weight=current_neural_weight,
                     )
+                    futures.append(future)
+                    time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
 
-                episode_lengths.append(len(episode_transitions))
+                for future in futures:
+                    result = future.result()
+                    if result["win"]:
+                        wins += 1
+                    episode_transitions = result["episode_transitions"]
+                    shaped_outcome = result["shaped_outcome"]
+                    outcome_weight = result["outcome_weight"]
+                    preview_observation = result["preview_observation"]
+                    preview_action = result["preview_action"]
+                    
+                    preview_observation_tensors = {
+                        key: value.to(self.device) if isinstance(value, torch.Tensor) 
+                        else torch.as_tensor(value, dtype=torch.float32, device=self.device)
+                        for key, value in preview_observation.items()
+                    }
+                    logits, preview_value = self.preview_model(preview_observation_tensors)
+                    distribution = torch.distributions.Categorical(logits=logits)
+                    action_tensor = torch.as_tensor(preview_action, device=self.device)
+                    preview_log_probability = distribution.log_prob(action_tensor)
+                    entropy = distribution.entropy()
+            
+                    # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
+                    # it will backprop through the policy loss part as well. This is for the preview model.
+                    advantage = shaped_outcome - preview_value.item()
+                    policy_loss = -preview_log_probability * advantage
+                    value_loss = 0.5 * ((preview_value - shaped_outcome) ** 2)
+                    entropy_loss = -0.01 * entropy
+                    preview_loss = policy_loss + value_loss + entropy_loss
+                    
+                    self.preview_optimizer.zero_grad()
+                    preview_loss.backward()
+                    self.preview_optimizer.step()
+                    
+                    if isinstance(self.searcher.evaluator, HybridEvaluator):
+                        self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
+                        self.searcher.evaluator.neural_weight = float(np.clip(self.searcher.evaluator.neural_weight, 0.0, 1.0))
+
+                    is_validation_episode = np.random.rand() < 0.1  # 10% of episodes are reserved for validation buffer
+                    destination_buffer = self.validation_buffer if is_validation_episode else self.replay_buffer
+
+                    # Store transitions with outcome-anchored value targets into the replay buffer
+                    for transition_observation, transition_mask, transition_target_policy, local_value in episode_transitions:
+                        blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
+                        destination_buffer.append(
+                            Transition(
+                                observation=transition_observation,
+                                action_mask=transition_mask,
+                                target_policy=transition_target_policy,
+                                target_value=float(np.clip(blended_value_target, -1.0, 1.0)),
+                            )
+                        )
+
+                    episode_lengths.append(len(episode_transitions))
+            except KeyboardInterrupt:
+                print("Training interrupted by user. Terminating all workers gracefully...")
+                for pid in list(executor._processes.keys()):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except Exception as e:
+                        print(f"Error terminating process {pid}: {e}")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
         return wins, episode_lengths
 
@@ -586,29 +597,39 @@ class ExpertIterationTrainer:
         context = mp.get_context("spawn")  # Use 'spawn' to avoid issues with CUDA in child processes
 
         with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
-            futures = []
-            for _ in range(n_episodes):
-                future = executor.submit(
-                    _evaluate_single_validation_episode,
-                    model_path=os.path.join(self.best_model_directory, "temp_ppo_model.zip"),
-                    preview_model_path=os.path.join(self.best_model_directory, "temp_preview_model.pt"),
-                    device=self.device,
-                    depth=self.search_depth,
-                    max_candidates=self.searcher.max_candidates
-                )
-                futures.append(future)
-                time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
+            try:
+                futures = []
+                for _ in range(n_episodes):
+                    future = executor.submit(
+                        _evaluate_single_validation_episode,
+                        model_path=os.path.join(self.best_model_directory, "temp_ppo_model.zip"),
+                        preview_model_path=os.path.join(self.best_model_directory, "temp_preview_model.pt"),
+                        device=self.device,
+                        depth=self.search_depth,
+                        max_candidates=self.searcher.max_candidates
+                    )
+                    futures.append(future)
+                    time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
 
-            for future in futures:
-                result = future.result()
-                if result["win"]:
-                    wins += 1
-                rewards.append(result["reward"])
-                turns.append(result["turns"])
-                for archetype in result["opp_archetypes"]:
-                    results_by_opp_archetype[archetype].append(1.0 if result["win"] else 0.0)
-                for archetype in result["own_archetypes"]:
-                    results_by_own_archetype[archetype].append(1.0 if result["win"] else 0.0)
+                for future in futures:
+                    result = future.result()
+                    if result["win"]:
+                        wins += 1
+                    rewards.append(result["reward"])
+                    turns.append(result["turns"])
+                    for archetype in result["opp_archetypes"]:
+                        results_by_opp_archetype[archetype].append(1.0 if result["win"] else 0.0)
+                    for archetype in result["own_archetypes"]:
+                        results_by_own_archetype[archetype].append(1.0 if result["win"] else 0.0)
+            except KeyboardInterrupt:
+                print("Evaluation interrupted by user. Terminating all workers gracefully...")
+                for pid in list(executor._processes.keys()):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except Exception as e:
+                        print(f"Error terminating process {pid}: {e}")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
         if n_episodes == 0:
             return 0.0, 0.0, 0.0

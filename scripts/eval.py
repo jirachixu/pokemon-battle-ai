@@ -10,6 +10,10 @@ import argparse
 import uuid
 import numpy as np
 import torch
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import time
+import signal
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
@@ -24,28 +28,25 @@ from src.models import TeamPreviewModel
 from src.players import LookaheadPlayer
 from src.team_pool import ALL_ARCHETYPES, TeamInfo, classify_paste, extract_pokemon_names
 
-def evaluate_neural_lookahead(
+def _evaluate_single_episode(
     model_path: str = "./checkpoints/best_model/best_model.zip",
     preview_model_path: str = "./checkpoints/best_model/best_team_preview_model.pt",
     team_path: str = "teams/MC646.txt",
-    n_eval_episodes: int = 50,
     search_depth: int = 2,
     search_candidates: int = 9,
     opponent_type: str = "simple_heuristics",
     sample_teams: bool = True,
-) -> tuple[float, float, float]:
-    """
-    Evaluates the trained neural-guided lookahead player against a specified opponent.
-    Returns (win_rate, mean_reward, mean_turns).
-    """
+) -> tuple[float, int, TeamInfo | None, TeamInfo | None]:
+    torch.set_num_threads(1)
+    
     with open(team_path, "r", encoding="utf-8") as file_handle:
         team_paste = file_handle.read().strip()
 
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading trained neural model from: {model_path} on {device_name}...")
+    # print(f"Loading trained neural model from: {model_path} on {device_name}...")
     model = MaskablePPO.load(model_path, device=device_name)
 
-    print(f"Loading trained team preview model from: {preview_model_path} on {device_name}...")
+    # print(f"Loading trained team preview model from: {preview_model_path} on {device_name}...")
     preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device_name)
     preview_model.load_state_dict(torch.load(preview_model_path, map_location=device_name))
     preview_model.eval()
@@ -75,7 +76,7 @@ def evaluate_neural_lookahead(
             accept_open_team_sheet=True,
             account_configuration=AccountConfiguration(f"Heuristic_{uuid.uuid4().hex[:6]}", None),
         )
-
+    
     raw_env = VGCEnv(opponent=opponent, sample_teams=sample_teams)
     raw_env.agent.update_team(team=team_paste)
     raw_env.agent.team_preview_model = preview_model
@@ -100,9 +101,71 @@ def evaluate_neural_lookahead(
         evaluator=HybridEvaluator(model=model, neural_weight=1.0),
     )
 
+    observation, _ = raw_env.reset()
+    if not sample_teams and raw_env.agent_team is None:
+        raw_env.agent_team = fixed_team_info
+        raw_env.opponent_team = fixed_team_info
+
+    is_terminated = False
+    is_truncated = False
+    cumulative_reward = 0.0
+    turn_count = 0
+
+    while not (is_terminated or is_truncated):
+        current_battle = raw_env.current_battle
+        current_action_mask = raw_env.action_masks()
+
+        # 1. Human-like Intuition: Neural Network Policy Prior
+        tensor_obs, _ = model.policy.obs_to_tensor(observation)
+        with torch.no_grad():
+            distribution = model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
+            if not isinstance(distribution, MaskableCategoricalDistribution):
+                raise TypeError("Expected MaskableCategoricalDistribution from policy")
+            categorical_distribution = distribution.distribution
+            policy_probs_tensor: torch.Tensor = categorical_distribution.probs
+            policy_probs = policy_probs_tensor.squeeze(0).cpu().numpy()
+            # state_value_pred = float(model.policy.predict_values(tensor_obs).squeeze().item())
+
+        # top_nn_action = int(np.argmax(policy_probs))
+        # top_nn_prob = float(policy_probs[top_nn_action])
+
+        # 2. Human-like Calculation: 2-Turn Nash Equilibrium Game Tree Search
+        simulated_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
+        search_result = searcher.search(simulated_state, policy_prior=policy_probs)
+
+        # 3. Deterministic Execution: Pure Argmax of the Verified Best Line
+        chosen_action_code = int(min(675, max(0, searcher.to_env_action(search_result.best_action, current_battle))))
+        if not current_action_mask[chosen_action_code]:
+            legal_indices = np.where(current_action_mask)[0]
+            if len(legal_indices) > 0:
+                chosen_action_code = int(legal_indices[0])
+
+        observation, reward, is_terminated, is_truncated, _ = raw_env.step(chosen_action_code)
+        cumulative_reward += reward
+        turn_count += 1
+    
+    raw_env.close()
+    return cumulative_reward, turn_count, raw_env.agent_team, raw_env.opponent_team
+
+def evaluate_neural_lookahead(
+    model_path: str = "./checkpoints/best_model/best_model.zip",
+    preview_model_path: str = "./checkpoints/best_model/best_team_preview_model.pt",
+    team_path: str = "teams/MC646.txt",
+    n_eval_episodes: int = 50,
+    search_depth: int = 2,
+    search_candidates: int = 9,
+    opponent_type: str = "simple_heuristics",
+    sample_teams: bool = True,
+    max_workers: int = 5,
+) -> tuple[float, float, float]:
+    """
+    Evaluates the trained neural-guided lookahead player against a specified opponent.
+    Returns (win_rate, mean_reward, mean_turns).
+    """
+
     print(f"\n=======================================================")
     print(f"  Evaluating Neural-Guided Lookahead AI")
-    print(f"  Opponent: {opponent.__class__.__name__} ({opponent_type})")
+    print(f"  Opponent: {opponent_type}")
     print(f"  Lookahead Depth: {search_depth} | Candidates: {search_candidates}")
     print(f"  Episodes: {n_eval_episodes} | Mode: Pure Deterministic Argmax")
     print(f"  Team Sampling: {'Multi-Team Stratified Pool' if sample_teams else f'Fixed Team ({team_path})'}")
@@ -110,8 +173,10 @@ def evaluate_neural_lookahead(
 
     wins = 0
     losses = 0
+    episode_index = 0
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
+    context = mp.get_context("spawn")  # Use 'spawn' to avoid issues with CUDA in subprocesses
 
     opponent_archetype_stats: dict[str, dict[str, int]] = {
         arch: {"wins": 0, "losses": 0, "total": 0} for arch in ALL_ARCHETYPES
@@ -119,113 +184,86 @@ def evaluate_neural_lookahead(
     agent_archetype_stats: dict[str, dict[str, int]] = {
         arch: {"wins": 0, "losses": 0, "total": 0} for arch in ALL_ARCHETYPES
     }
+    
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=context) as executor:
+        try:
+            futures = []
+            for _ in range(n_eval_episodes):
+                future = executor.submit(
+                    _evaluate_single_episode,
+                    model_path=model_path,
+                    preview_model_path=preview_model_path,
+                    team_path=team_path,
+                    search_depth=search_depth,
+                    search_candidates=search_candidates,
+                    opponent_type=opponent_type,
+                    sample_teams=sample_teams,
+                )
+                futures.append(future)
+                time.sleep(0.2)
+                
+            for future in futures:
+                cumulative_reward, turn_count, agent_team, opponent_team = future.result()
+                is_win = cumulative_reward > 0.0
+                if is_win:
+                    wins += 1
+                else:
+                    losses += 1
 
-    for episode_index in range(1, n_eval_episodes + 1):
-        observation, _ = raw_env.reset()
-        if not sample_teams and raw_env.agent_team is None:
-            raw_env.agent_team = fixed_team_info
-            raw_env.opponent_team = fixed_team_info
+                episode_index += 1
+                episode_rewards.append(cumulative_reward)
+                episode_lengths.append(turn_count)
+                running_win_rate = (wins / episode_index) * 100.0
 
-        is_terminated = False
-        is_truncated = False
-        cumulative_reward = 0.0
-        turn_count = 0
+                agent_team, opponent_team = agent_team, opponent_team
+                team_info = (
+                    f"Agent Team: {agent_team.team_id}, {agent_team.archetypes} | Opponent Team: {opponent_team.team_id}, {opponent_team.archetypes}"
+                    if agent_team and opponent_team
+                    else "Teams not sampled"
+                )
 
-        while not (is_terminated or is_truncated):
-            current_battle = raw_env.current_battle
-            current_action_mask = raw_env.action_masks()
+                agent_archetypes = agent_team.archetypes if agent_team and agent_team.archetypes else {"other"}
+                opponent_archetypes = opponent_team.archetypes if opponent_team and opponent_team.archetypes else {"other"}
 
-            # 1. Human-like Intuition: Neural Network Policy Prior
-            tensor_obs, _ = model.policy.obs_to_tensor(observation)
-            with torch.no_grad():
-                distribution = model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
-                if not isinstance(distribution, MaskableCategoricalDistribution):
-                    raise TypeError("Expected MaskableCategoricalDistribution from policy")
-                categorical_distribution = distribution.distribution
-                policy_probs_tensor: torch.Tensor = categorical_distribution.probs
-                policy_probs = policy_probs_tensor.squeeze(0).cpu().numpy()
-                state_value_pred = float(model.policy.predict_values(tensor_obs).squeeze().item())
+                for arch in opponent_archetypes:
+                    opponent_archetype_stats.setdefault(arch, {"wins": 0, "losses": 0, "total": 0})
+                    opponent_archetype_stats[arch]["total"] += 1
+                    if is_win:
+                        opponent_archetype_stats[arch]["wins"] += 1
+                    else:
+                        opponent_archetype_stats[arch]["losses"] += 1
 
-            top_nn_action = int(np.argmax(policy_probs))
-            top_nn_prob = float(policy_probs[top_nn_action])
+                for arch in agent_archetypes:
+                    agent_archetype_stats.setdefault(arch, {"wins": 0, "losses": 0, "total": 0})
+                    agent_archetype_stats[arch]["total"] += 1
+                    if is_win:
+                        agent_archetype_stats[arch]["wins"] += 1
+                    else:
+                        agent_archetype_stats[arch]["losses"] += 1
 
-            # 2. Human-like Calculation: 2-Turn Nash Equilibrium Game Tree Search
-            simulated_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
-            search_result = searcher.search(simulated_state, policy_prior=policy_probs)
-
-            # 3. Deterministic Execution: Pure Argmax of the Verified Best Line
-            chosen_action_code = int(min(675, max(0, searcher.to_env_action(search_result.best_action, current_battle))))
-            if not current_action_mask[chosen_action_code]:
-                legal_indices = np.where(current_action_mask)[0]
-                if len(legal_indices) > 0:
-                    chosen_action_code = int(legal_indices[0])
-
-            observation, reward, is_terminated, is_truncated, _ = raw_env.step(chosen_action_code)
-            cumulative_reward += reward
-            turn_count += 1
-
-            agent_team, opponent_team = raw_env.agent_team, raw_env.opponent_team
-            team_info = (
-                f"Agent Team: {agent_team.team_id}, {agent_team.archetypes} | Opponent Team: {opponent_team.team_id}, {opponent_team.archetypes}"
-                if agent_team and opponent_team
-                else "Teams not sampled"
-            )
-            print(
-                f"    [Turn {current_battle.turn:2d} (Step {turn_count:2d})] "
-                f"Action: {chosen_action_code:3d} (NN Top: {top_nn_action:3d} p={top_nn_prob:.2f} V={state_value_pred:+.2f}) | "
-                f"Step Reward: {reward:+.3f} | Total: {cumulative_reward:+.3f} | "
-                f"{team_info}"
-            )
-
-        is_win = cumulative_reward > 0.0
-        if is_win:
-            wins += 1
-        else:
-            losses += 1
-
-        episode_rewards.append(cumulative_reward)
-        episode_lengths.append(turn_count)
-        running_win_rate = (wins / episode_index) * 100.0
-
-        agent_team, opponent_team = raw_env.agent_team, raw_env.opponent_team
-        team_info = (
-            f"Agent Team: {agent_team.team_id}, {agent_team.archetypes} | Opponent Team: {opponent_team.team_id}, {opponent_team.archetypes}"
-            if agent_team and opponent_team
-            else "Teams not sampled"
-        )
-
-        agent_archetypes = agent_team.archetypes if agent_team and agent_team.archetypes else {"other"}
-        opponent_archetypes = opponent_team.archetypes if opponent_team and opponent_team.archetypes else {"other"}
-
-        for arch in opponent_archetypes:
-            opponent_archetype_stats.setdefault(arch, {"wins": 0, "losses": 0, "total": 0})
-            opponent_archetype_stats[arch]["total"] += 1
-            if is_win:
-                opponent_archetype_stats[arch]["wins"] += 1
-            else:
-                opponent_archetype_stats[arch]["losses"] += 1
-
-        for arch in agent_archetypes:
-            agent_archetype_stats.setdefault(arch, {"wins": 0, "losses": 0, "total": 0})
-            agent_archetype_stats[arch]["total"] += 1
-            if is_win:
-                agent_archetype_stats[arch]["wins"] += 1
-            else:
-                agent_archetype_stats[arch]["losses"] += 1
-
-        print(
-            f"Battle {episode_index:3d}/{n_eval_episodes:3d} | "
-            f"Result: {'WIN ' if is_win else 'LOSS'} | "
-            f"Turns: {turn_count:2d} | "
-            f"Reward: {cumulative_reward:+.2f} | "
-            f"Running WinRate: {running_win_rate:5.1f}% ({wins}W - {losses}L) | "
-            f"{team_info}"
-        )
-        opp_strat_info = ", ".join(
-            f"{a}: {opponent_archetype_stats[a]['wins']}/{opponent_archetype_stats[a]['total']} ({(opponent_archetype_stats[a]['wins']/opponent_archetype_stats[a]['total'])*100:.1f}%)"
-            for a in sorted(opponent_archetypes)
-        )
-        print(f"    Running Stratified vs Opponent Archetypes: [{opp_strat_info}]")
+                print(
+                    f"Battle {episode_index:3d}/{n_eval_episodes:3d} | "
+                    f"Result: {'WIN ' if is_win else 'LOSS'} | "
+                    f"Turns: {turn_count:2d} | "
+                    f"Reward: {cumulative_reward:+.2f} | "
+                    f"Running WinRate: {running_win_rate:5.1f}% ({wins}W - {losses}L) | "
+                    f"{team_info}"
+                )
+                opp_strat_info = ", ".join(
+                    f"{a}: {opponent_archetype_stats[a]['wins']}/{opponent_archetype_stats[a]['total']} ({(opponent_archetype_stats[a]['wins']/opponent_archetype_stats[a]['total'])*100:.1f}%)"
+                    for a in sorted(opponent_archetypes)
+                )
+                print(f"    Running Stratified Win Rate vs Opponent Archetypes: [{opp_strat_info}]")
+            
+        except KeyboardInterrupt:
+            print("\nEvaluation interrupted by user. Terminating all workers gracefully...")
+            for pid in list(executor._processes.keys()):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception as e:
+                    print(f"Error while terminating workers: {e}")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
 
     final_win_rate = (wins / max(1, n_eval_episodes)) * 100.0
     final_mean_reward = float(np.mean(episode_rewards)) if episode_rewards else 0.0
