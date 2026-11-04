@@ -8,10 +8,13 @@ from __future__ import annotations
 import os
 import collections
 import uuid
-from typing import Optional
+from typing import Any, Optional
 import numpy as np
 import torch
 import torch.optim as optim
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+import time
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
@@ -28,7 +31,7 @@ from src.evaluator import (
 )
 from src.simulation import SimulatedBattleState
 from src.search import LookaheadSearch
-from src.players import LookaheadPlayer
+from src.players import LookaheadPlayer, RLPlayer
 from src.models import VGCFeatureExtractor, TeamPreviewModel
 
 # Transition structure for Expert Iteration replay buffer
@@ -36,6 +39,247 @@ Transition = collections.namedtuple(
     "Transition",
     ["observation", "action_mask", "target_policy", "target_value"]
 )
+
+def _evaluate_single_validation_episode(
+    model_path: str = "./checkpoints/best_model/temp_ppo_model.zip",
+    preview_model_path: str = "./checkpoints/best_model/temp_preview_model.pt",
+    device: str = "cuda" if (torch and torch.cuda.is_available()) else "cpu",
+    depth: int = 2,
+    max_candidates: int = 9
+) -> dict[str, Any]:
+    """
+    Runs a single validation episode and returns the results. For parallel evaluation.
+    """
+    torch.set_num_threads(1)
+    model = MaskablePPO.load(model_path, device=device)
+    preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device)
+    preview_model.load_state_dict(torch.load(preview_model_path, map_location=device))
+    opponent = SimpleHeuristicsPlayer(
+        battle_format="gen9championsvgc2026regmc",
+        accept_open_team_sheet=True,
+        account_configuration=AccountConfiguration(f"Heuristic_{uuid.uuid4().hex[:6]}", None),
+    )
+    eval_environment = VGCEnv(opponent=opponent)
+    eval_searcher = LookaheadSearch(
+        model=model,
+        evaluator=NeuralValueEvaluator(
+            model=model,
+        ),
+        depth=depth,
+        max_candidates=max_candidates
+    )
+    eval_environment.agent.team_preview_model = preview_model
+    
+    if eval_environment is None:
+        return {"win": False, "reward": 0.0, "turns": 0, "own_archetypes": [], "opp_archetypes": []}
+
+    observation, _ = eval_environment.reset()
+    is_terminated, is_truncated = False, False
+    own_archetypes = eval_environment.agent_team.archetypes if eval_environment.agent_team else ["Unknown"]
+    opp_archetypes = eval_environment.opponent_team.archetypes if eval_environment.opponent_team else ["Unknown"]
+    cumulative_reward = 0.0
+    turn_count = 0
+    
+    while not (is_terminated or is_truncated):
+        current_battle = eval_environment.current_battle
+        current_action_mask = eval_environment.action_masks()
+        tensor_obs, _ = model.policy.obs_to_tensor(observation)
+        simulated_battle_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
+        with torch.no_grad():
+            distribution = model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
+            if isinstance(distribution, MaskableCategoricalDistribution):
+                policy_probs = distribution.distribution.probs.squeeze(0).cpu().numpy()
+                policy_probs = np.where(current_action_mask, policy_probs, 0.0)  # Mask illegal actions
+            else:
+                policy_probs = np.ones(676, dtype=np.float32)
+
+        search_result = eval_searcher.search(simulated_battle_state, policy_prior=policy_probs)
+        chosen_action = int(min(675, max(0, eval_searcher.to_env_action(search_result.best_action, current_battle))))
+
+        observation, step_reward, is_terminated, is_truncated, _ = eval_environment.step(chosen_action)
+        cumulative_reward += float(step_reward)
+        turn_count += 1
+    
+    won = cumulative_reward > 0
+    eval_environment.close()
+    
+    return {
+        "win": won, 
+        "reward": cumulative_reward, 
+        "turns": turn_count, 
+        "own_archetypes": own_archetypes, 
+        "opp_archetypes": opp_archetypes
+    }
+
+def _collect_single_lookahead_episode(
+    model_path: str,
+    preview_model_path: str,
+    current_neural_weight: float,
+    depth: int = 2,
+    max_candidates: int = 9,
+    device: str = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
+) -> dict[str, Any]:
+    """
+    Plays a full battle where every decision is computed by the 2-turn lookahead search. For parallel collection of 
+    training episodes.
+    """
+    torch.set_num_threads(1)  # Prevent PyTorch from using multiple threads in child processes, speeds up training
+    model = MaskablePPO.load(model_path, device=device)
+    preview_model = TeamPreviewModel(ability_dim=32, item_dim=32).to(device)
+    preview_model.load_state_dict(torch.load(preview_model_path, map_location=device))
+    
+    searcher = LookaheadSearch(
+        model=model,
+        evaluator=HybridEvaluator(
+            model=model,
+            neural_weight=current_neural_weight,
+        ),
+        depth=depth,
+        max_candidates=max_candidates
+    )
+    
+    training_environment = VGCEnv(
+        opponent=LookaheadPlayer(
+            battle_format="gen9championsvgc2026regmc",
+            accept_open_team_sheet=True,
+            depth=depth,
+            max_candidates=max_candidates,
+            evaluator=CompetitiveHeuristicEvaluator(),
+            team_preview_model=preview_model,
+            account_configuration=AccountConfiguration(f"Lookahead_{uuid.uuid4().hex[:6]}", None),
+        )
+    )
+    
+    training_environment.agent.team_preview_model = preview_model
+    observation, _ = training_environment.reset()
+    is_terminated, is_truncated = False, False
+    episode_transitions: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, float]] = []
+    cumulative_reward = 0.0
+    turn_count = 0.0
+    last_teampreview_observation = training_environment.agent.last_teampreview_observation
+    preview_action = training_environment.agent.last_preview_decision
+    shaped_outcome = 0.0
+    outcome_weight = 0.0
+    
+    current_battle = training_environment.current_battle
+    
+    while not (is_terminated or is_truncated):
+        current_action_mask = training_environment.action_masks()
+
+        # 1. Convert live battle state to forward simulation snapshot
+        simulated_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
+
+        # 2. Query the current neural network policy and value head to guide the search
+        tensor_obs, _ = model.policy.obs_to_tensor(observation)
+        with torch.no_grad():
+            distribution = model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
+            if not isinstance(distribution, MaskableCategoricalDistribution):
+                raise TypeError("Expected MaskableCategoricalDistribution from policy")
+            categorical_distribution = distribution.distribution
+            policy_probs_tensor: torch.Tensor = categorical_distribution.probs
+            policy_probs = policy_probs_tensor.squeeze(0).cpu().numpy()
+            # state_value_pred = float(model.policy.predict_values(tensor_obs).squeeze().item())
+
+        # top_nn_action = int(np.argmax(policy_probs))
+        # top_nn_prob = float(policy_probs[top_nn_action])
+
+        # AlphaZero root exploration noise (80% prior + 20% Dirichlet noise on legal actions)
+        legal_indices = np.where(current_action_mask)[0]
+        if len(legal_indices) > 1:
+            dirichlet_noise = np.random.dirichlet([0.3] * len(legal_indices)).astype(np.float32)
+            noisy_policy_prior = policy_probs.copy()
+            noisy_policy_prior[legal_indices] = (0.80 * policy_probs[legal_indices]) + (0.20 * dirichlet_noise)
+        else:
+            noisy_policy_prior = policy_probs
+
+        # 3. RUN 2-TURN GAME-THEORETIC NASH SEARCH (DIRECTLY GUIDED BY MODEL WEIGHTS)
+        search_result = searcher.search(simulated_state, policy_prior=noisy_policy_prior)
+
+        # 4. Construct target policy distribution from search result
+        target_policy_distribution = np.zeros(676, dtype=np.float32)
+        if search_result.action_distribution:
+            for simulated_action_pair, probability in search_result.action_distribution.items():
+                action_code = searcher.to_env_action(simulated_action_pair, current_battle)
+                if 0 <= action_code < 676 and current_action_mask[action_code]:
+                    target_policy_distribution[action_code] += probability
+
+        # If distribution is single-action or empty, place full probability on best action
+        chosen_action_code = int(min(675, max(0, searcher.to_env_action(search_result.best_action, current_battle))))
+        if not current_action_mask[chosen_action_code]:
+            if len(legal_indices) > 0:
+                chosen_action_code = int(legal_indices[0])
+
+        if target_policy_distribution.sum() == 0.0:
+            target_policy_distribution[chosen_action_code] = 1.0
+        else:
+            target_policy_distribution /= target_policy_distribution.sum()
+
+        # Execute action: sample from Nash mixed distribution 85% of turns to prevent deterministic traps
+        if np.random.rand() < 0.85 and target_policy_distribution.sum() > 0.0:
+            sampled_action = int(np.random.choice(676, p=target_policy_distribution))
+            if current_action_mask[sampled_action]:
+                chosen_action_code = sampled_action
+
+        # Compute immediate board heuristic value in [-1, 1] and blend with 2-turn lookahead search value
+        # so intermediate states preserve exact sensitivity to current material, HP%, speed control, and boosts
+        # current_heur_norm = float(torch.tanh(self.heuristic_evaluator.evaluate(simulated_state) / 8000.0).item())
+        local_board_value = float(np.clip(float(search_result.value), -1.0, 1.0))
+
+        # Record transition for this turn
+        episode_transitions.append((observation, current_action_mask, target_policy_distribution, local_board_value))
+
+        # 5. Step environment with the lookahead-chosen action
+        observation, reward, is_terminated, is_truncated, _ = training_environment.step(chosen_action_code)
+        cumulative_reward += reward
+        turn_count = len(episode_transitions)
+        
+    # Count living Pokémon and remaining HP fraction (0.0 to 4.0)
+    team_alive = [
+        p for p in current_battle.team.values()
+        if p and not p.fainted and getattr(p, "selected_in_teampreview", True)
+    ]
+    opp_revealed_alive = [
+        p for p in current_battle.opponent_team.values()
+        if p and not p.fainted and getattr(p, "revealed", False)
+    ]
+    opp_fainted_count = sum(1 for p in current_battle.opponent_team.values() if p and p.fainted)
+    opp_unrevealed_alive_count = max(0, 4 - opp_fainted_count - len(opp_revealed_alive))
+    opp_alive_count = len(opp_revealed_alive) + opp_unrevealed_alive_count
+
+    # Compute shaped outcome based on win/loss and remaining HP fraction, so that the value head can learn to 
+    # predict not just win/loss but also the degree of victory/defeat
+    team_hp_frac = sum(p.current_hp_fraction for p in team_alive if p.current_hp_fraction is not None)
+    opp_hp_frac = (
+        sum(p.current_hp_fraction for p in opp_revealed_alive if p.current_hp_fraction is not None)
+        + float(opp_unrevealed_alive_count)
+    )
+    if current_battle.won:
+        margin = (len(team_alive) + team_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
+        shaped_outcome = float(np.clip(0.55 + 0.45 * margin, 0.55, 1.0))
+    elif current_battle.lost:
+        opp_margin = (opp_alive_count + opp_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
+        shaped_outcome = float(np.clip(-0.55 - 0.45 * opp_margin, -1.0, -0.55))
+    else:
+        shaped_outcome = 0.0
+        
+    # Constant outcome anchoring: every turn's value target mixes the 2-turn lookahead search value
+    # with the actual game outcome at a fixed weight. The outcome is the only signal independent of
+    # both the heuristic and the network itself, which prevents self-referential value drift.
+    # Truncated / undecided games carry no outcome information, so they fall back to pure search value.
+    OUTCOME_WEIGHT = 0.5
+    outcome_weight = OUTCOME_WEIGHT if (current_battle.won or current_battle.lost) else 0.0
+            
+    training_environment.close()
+        
+    return {
+        "win": True if cumulative_reward > 0 else False,
+        "turn_count": turn_count,
+        "episode_transitions": episode_transitions,
+        "preview_observation": last_teampreview_observation,
+        "shaped_outcome": shaped_outcome,
+        "outcome_weight": outcome_weight,
+        "preview_action": preview_action,
+    }
 
 class ExpertIterationTrainer:
     """
@@ -53,7 +297,7 @@ class ExpertIterationTrainer:
         training_environment: VGCEnv,
         preview_model: TeamPreviewModel,
         search_depth: int = 2,
-        search_candidates_limit: int = 10,
+        search_candidates_limit: int = 9,
         replay_buffer_capacity: int = 15000,
         learning_rate: float = 3e-5,
         batch_size: int = 64,
@@ -64,6 +308,7 @@ class ExpertIterationTrainer:
         best_model_directory: str = "./checkpoints/best_model/",
         device: str = "cuda" if (torch and torch.cuda.is_available()) else "cpu",
         eval_environment: Optional[VGCEnv] = None,
+        num_workers: int = 8,
     ):
         self.model = model
         self.training_environment = training_environment
@@ -93,6 +338,7 @@ class ExpertIterationTrainer:
         self.best_eval_win_rate = 0.0
         self.generator = np.random.default_rng()
         self.target_neural_weight = 0.5
+        self.num_workers = num_workers
 
         os.makedirs(self.checkpoint_directory, exist_ok=True)
         os.makedirs(self.best_model_directory, exist_ok=True)
@@ -104,176 +350,97 @@ class ExpertIterationTrainer:
             self.optimizer = None
             self.preview_optimizer = None
         
-    def collect_lookahead_episode(self) -> tuple[float, int]:
+    def collect_lookahead_episodes(self) -> tuple[int, list[int]]:
         """
         Plays a full battle where every decision is computed by the 2-turn lookahead search.
         Records the (observation, action_mask, search_policy_target, local_board_value) transitions.
-        Returns (episode_reward, episode_turn_count).
+        Returns (wins, episode_turn_counts).
         """
         if torch is None or self.preview_optimizer is None:
             raise RuntimeError("PyTorch is required to train the team preview model.")
         
-        observation, _ = self.training_environment.reset()
-        episode_transitions: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, float]] = []
-        is_terminated = False
-        is_truncated = False
-        cumulative_reward = 0.0
-        # Record the team preview decision for policy/value training
-        preview_data = self.training_environment.agent.last_preview_decision
-        preview_log_probability = preview_data["log_probability"]
-        preview_value = preview_data["value"]
-
-        while not (is_terminated or is_truncated):
-            current_battle = self.training_environment.current_battle
-            current_action_mask = self.training_environment.action_masks()
-
-            # 1. Convert live battle state to forward simulation snapshot
-            simulated_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
-
-            # 2. Query the current neural network policy and value head to guide the search
-            tensor_obs, _ = self.model.policy.obs_to_tensor(observation)
-            with torch.no_grad():
-                distribution = self.model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
-                if not isinstance(distribution, MaskableCategoricalDistribution):
-                    raise TypeError("Expected MaskableCategoricalDistribution from policy")
-                categorical_distribution = distribution.distribution
-                policy_probs_tensor: torch.Tensor = categorical_distribution.probs
-                policy_probs = policy_probs_tensor.squeeze(0).cpu().numpy()
-                state_value_pred = float(self.model.policy.predict_values(tensor_obs).squeeze().item())
-
-            top_nn_action = int(np.argmax(policy_probs))
-            top_nn_prob = float(policy_probs[top_nn_action])
-
-            # AlphaZero root exploration noise (80% prior + 20% Dirichlet noise on legal actions)
-            legal_indices = np.where(current_action_mask)[0]
-            if len(legal_indices) > 1:
-                dirichlet_noise = np.random.dirichlet([0.3] * len(legal_indices)).astype(np.float32)
-                noisy_policy_prior = policy_probs.copy()
-                noisy_policy_prior[legal_indices] = (0.80 * policy_probs[legal_indices]) + (0.20 * dirichlet_noise)
-            else:
-                noisy_policy_prior = policy_probs
-
-            # 3. RUN 2-TURN GAME-THEORETIC NASH SEARCH (DIRECTLY GUIDED BY MODEL WEIGHTS)
-            search_result = self.searcher.search(simulated_state, policy_prior=noisy_policy_prior)
-
-            # 4. Construct target policy distribution from search result
-            target_policy_distribution = np.zeros(676, dtype=np.float32)
-            if search_result.action_distribution:
-                for simulated_action_pair, probability in search_result.action_distribution.items():
-                    action_code = self.searcher.to_env_action(simulated_action_pair, current_battle)
-                    if 0 <= action_code < 676 and current_action_mask[action_code]:
-                        target_policy_distribution[action_code] += probability
-
-            # If distribution is single-action or empty, place full probability on best action
-            chosen_action_code = int(min(675, max(0, self.searcher.to_env_action(search_result.best_action, current_battle))))
-            if not current_action_mask[chosen_action_code]:
-                if len(legal_indices) > 0:
-                    chosen_action_code = int(legal_indices[0])
-
-            if target_policy_distribution.sum() == 0.0:
-                target_policy_distribution[chosen_action_code] = 1.0
-            else:
-                target_policy_distribution /= target_policy_distribution.sum()
-
-            # Execute action: sample from Nash mixed distribution 85% of turns to prevent deterministic traps
-            if np.random.rand() < 0.85 and target_policy_distribution.sum() > 0.0:
-                sampled_action = int(np.random.choice(676, p=target_policy_distribution))
-                if current_action_mask[sampled_action]:
-                    chosen_action_code = sampled_action
-
-            # Compute immediate board heuristic value in [-1, 1] and blend with 2-turn lookahead search value
-            # so intermediate states preserve exact sensitivity to current material, HP%, speed control, and boosts
-            # current_heur_norm = float(torch.tanh(self.heuristic_evaluator.evaluate(simulated_state) / 8000.0).item())
-            local_board_value = float(np.clip(float(search_result.value), -1.0, 1.0))
-
-            # Record transition for this turn
-            episode_transitions.append((observation, current_action_mask, target_policy_distribution, local_board_value))
-
-            # 5. Step environment with the lookahead-chosen action
-            observation, reward, is_terminated, is_truncated, _ = self.training_environment.step(chosen_action_code)
-            cumulative_reward += reward
-            turn_count = len(episode_transitions)
-            
-            agent_team, opponent_team = self.training_environment.agent_team, self.training_environment.opponent_team
-            team_info = f"Agent Team: {agent_team.team_id}, {agent_team.archetypes} | Opponent Team: {opponent_team.team_id}, {opponent_team.archetypes}" \
-                if agent_team and opponent_team else "Teams not sampled"
-            print(
-                f"    [Turn {current_battle.turn:2d} (Step {turn_count:2d})] "
-                f"Action: {chosen_action_code:3d} (NN Top: {top_nn_action:3d} p={top_nn_prob:.2f} V={state_value_pred:+.2f}) | "
-                f"Step Reward: {reward:+.3f} | Total: {cumulative_reward:+.3f} | "
-                f"{team_info}"
-            )
-
-        battle = self.training_environment.current_battle
+        self.model.save(os.path.join(self.checkpoint_directory, "temp_ppo_model.zip"))
+        torch.save(self.preview_model.state_dict(), os.path.join(self.checkpoint_directory, "temp_preview_model.pt"))
         
-        # Count living Pokémon and remaining HP fraction (0.0 to 4.0)
-        team_alive = [
-            p for p in battle.team.values()
-            if p and not p.fainted and getattr(p, "selected_in_teampreview", True)
-        ]
-        opp_revealed_alive = [
-            p for p in battle.opponent_team.values()
-            if p and not p.fainted and getattr(p, "revealed", False)
-        ]
-        opp_fainted_count = sum(1 for p in battle.opponent_team.values() if p and p.fainted)
-        opp_unrevealed_alive_count = max(0, 4 - opp_fainted_count - len(opp_revealed_alive))
-        opp_alive_count = len(opp_revealed_alive) + opp_unrevealed_alive_count
-
-        # Compute shaped outcome based on win/loss and remaining HP fraction, so that the value head can learn to 
-        # predict not just win/loss but also the degree of victory/defeat
-        team_hp_frac = sum(p.current_hp_fraction for p in team_alive if p.current_hp_fraction is not None)
-        opp_hp_frac = (
-            sum(p.current_hp_fraction for p in opp_revealed_alive if p.current_hp_fraction is not None)
-            + float(opp_unrevealed_alive_count)
-        )
-        if battle.won:
-            margin = (len(team_alive) + team_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
-            shaped_outcome = float(np.clip(0.55 + 0.45 * margin, 0.55, 1.0))
-        elif battle.lost:
-            opp_margin = (opp_alive_count + opp_hp_frac) / 8.0  # Normalized to [0.0, 1.0]
-            shaped_outcome = float(np.clip(-0.55 - 0.45 * opp_margin, -1.0, -0.55))
-        else:
-            shaped_outcome = 0.0
-
-        # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
-        # it will backprop through the policy loss part as well. This is for the preview model.
-        advantage = shaped_outcome - preview_value.item()
-        policy_loss = -preview_log_probability * advantage
-        value_loss = 0.5 * ((preview_value - shaped_outcome) ** 2)
-        entropy_loss = -0.01 * preview_data["entropy"]
-        preview_loss = policy_loss + value_loss + entropy_loss
+        context = mp.get_context("spawn")  # Use 'spawn' to avoid issues with CUDA in child processes
+        wins = 0
+        episode_lengths = []
+        # We cannot use 'self' in child processes because it may not be picklable, so we pass the necessary components explicitly
+        depth = self.search_depth
+        max_candidates = self.searcher.max_candidates
+        current_neural_weight = 0.0
+        if isinstance(self.searcher.evaluator, HybridEvaluator):
+            current_neural_weight = self.searcher.evaluator.neural_weight
         
-        self.preview_optimizer.zero_grad()
-        preview_loss.backward()
-        self.preview_optimizer.step()
-        
-        if isinstance(self.searcher.evaluator, HybridEvaluator) and self.searcher.evaluator.neural_weight < 1.0:
-            self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
-            self.searcher.evaluator.neural_weight = float(np.clip(self.searcher.evaluator.neural_weight, 0.0, 1.0))
-        
-        # Constant outcome anchoring: every turn's value target mixes the 2-turn lookahead search value
-        # with the actual game outcome at a fixed weight. The outcome is the only signal independent of
-        # both the heuristic and the network itself, which prevents self-referential value drift.
-        # Truncated / undecided games carry no outcome information, so they fall back to pure search value.
-        OUTCOME_WEIGHT = 0.5
-        outcome_weight = OUTCOME_WEIGHT if (battle.won or battle.lost) else 0.0
-        is_validation_episode = np.random.rand() < 0.1  # 10% of episodes are reserved for validation buffer
-        destination_buffer = self.validation_buffer if is_validation_episode else self.replay_buffer
-
-        # Store transitions with outcome-anchored value targets into the replay buffer
-        for transition_observation, transition_mask, transition_target_policy, local_value in episode_transitions:
-            blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
-            destination_buffer.append(
-                Transition(
-                    observation=transition_observation,
-                    action_mask=transition_mask,
-                    target_policy=transition_target_policy,
-                    target_value=float(np.clip(blended_value_target, -1.0, 1.0)),
+        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
+            futures = []
+            for _ in range(self.num_workers):
+                future = executor.submit(
+                    _collect_single_lookahead_episode,
+                    model_path=os.path.join(self.checkpoint_directory, "temp_ppo_model.zip"),
+                    preview_model_path=os.path.join(self.checkpoint_directory, "temp_preview_model.pt"),
+                    depth=depth,
+                    max_candidates=max_candidates,
+                    current_neural_weight=current_neural_weight,
                 )
-            )
+                futures.append(future)
+                time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
 
-        episode_length = len(episode_transitions)
-        return cumulative_reward, episode_length
+            for future in futures:
+                result = future.result()
+                if result["win"]:
+                    wins += 1
+                episode_transitions = result["episode_transitions"]
+                shaped_outcome = result["shaped_outcome"]
+                outcome_weight = result["outcome_weight"]
+                preview_observation = result["preview_observation"]
+                preview_action = result["preview_action"]
+                
+                preview_observation_tensors = {
+                    key: value.to(self.device) if isinstance(value, torch.Tensor) 
+                    else torch.as_tensor(value, dtype=torch.float32, device=self.device)
+                    for key, value in preview_observation.items()
+                }
+                logits, preview_value = self.preview_model(preview_observation_tensors)
+                distribution = torch.distributions.Categorical(logits=logits)
+                action_tensor = torch.as_tensor(preview_action, device=self.device)
+                preview_log_probability = distribution.log_prob(action_tensor)
+                entropy = distribution.entropy()
+        
+                # Use item() to prevent gradient tracking for the advantage calculation, otherwise when calculating value gradient 
+                # it will backprop through the policy loss part as well. This is for the preview model.
+                advantage = shaped_outcome - preview_value.item()
+                policy_loss = -preview_log_probability * advantage
+                value_loss = 0.5 * ((preview_value - shaped_outcome) ** 2)
+                entropy_loss = -0.01 * entropy
+                preview_loss = policy_loss + value_loss + entropy_loss
+                
+                self.preview_optimizer.zero_grad()
+                preview_loss.backward()
+                self.preview_optimizer.step()
+                
+                if isinstance(self.searcher.evaluator, HybridEvaluator):
+                    self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
+                    self.searcher.evaluator.neural_weight = float(np.clip(self.searcher.evaluator.neural_weight, 0.0, 1.0))
+
+                is_validation_episode = np.random.rand() < 0.1  # 10% of episodes are reserved for validation buffer
+                destination_buffer = self.validation_buffer if is_validation_episode else self.replay_buffer
+
+                # Store transitions with outcome-anchored value targets into the replay buffer
+                for transition_observation, transition_mask, transition_target_policy, local_value in episode_transitions:
+                    blended_value_target = (1.0 - outcome_weight) * local_value + outcome_weight * shaped_outcome
+                    destination_buffer.append(
+                        Transition(
+                            observation=transition_observation,
+                            action_mask=transition_mask,
+                            target_policy=transition_target_policy,
+                            target_value=float(np.clip(blended_value_target, -1.0, 1.0)),
+                        )
+                    )
+
+                episode_lengths.append(len(episode_transitions))
+
+        return wins, episode_lengths
 
     def train_step(self) -> tuple[float, float, float]:
         """
@@ -399,7 +566,7 @@ class ExpertIterationTrainer:
         
         return float(validation_loss.item())
 
-    def evaluate_benchmark(self, n_episodes: int = 25) -> tuple[float, float, float]:
+    def evaluate_benchmark(self, n_episodes: int = 100) -> tuple[float, float, float]:
         """
         Evaluates current neural network policy against benchmark environment (SimpleHeuristicsPlayer)
         in pure greedy deterministic mode (0 exploration noise).
@@ -411,61 +578,40 @@ class ExpertIterationTrainer:
         wins = 0
         rewards: list[float] = []
         turns: list[int] = []
-        eval_searcher = LookaheadSearch(
-            model=self.model,
-            evaluator=NeuralValueEvaluator(
-                model=self.model,
-            ),
-        )
         results_by_opp_archetype: dict[str, list[float]] = collections.defaultdict(list)
         results_by_own_archetype: dict[str, list[float]] = collections.defaultdict(list)
+        self.model.save(os.path.join(self.best_model_directory, "temp_ppo_model.zip"))
+        torch.save(self.preview_model.state_dict(), os.path.join(self.best_model_directory, "temp_preview_model.pt"))
+        
+        context = mp.get_context("spawn")  # Use 'spawn' to avoid issues with CUDA in child processes
 
-        for _ in range(n_episodes):
-            observation, _ = self.eval_environment.reset()
-            is_terminated = False
-            is_truncated = False
-            cumulative_reward = 0.0
-            turn_count = 0
+        with ProcessPoolExecutor(max_workers=self.num_workers, mp_context=context) as executor:
+            futures = []
+            for _ in range(n_episodes):
+                future = executor.submit(
+                    _evaluate_single_validation_episode,
+                    model_path=os.path.join(self.best_model_directory, "temp_ppo_model.zip"),
+                    preview_model_path=os.path.join(self.best_model_directory, "temp_preview_model.pt"),
+                    device=self.device,
+                    depth=self.search_depth,
+                    max_candidates=self.searcher.max_candidates
+                )
+                futures.append(future)
+                time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
 
-            while not (is_terminated or is_truncated):
-                current_battle = self.eval_environment.current_battle
-                current_action_mask = self.eval_environment.action_masks()
-                tensor_obs, _ = self.model.policy.obs_to_tensor(observation)
-                simulated_battle_state = SimulatedBattleState.from_battle(current_battle, fill_unrevealed=True)
-                with torch.no_grad():
-                    distribution = self.model.policy.get_distribution(tensor_obs, action_masks=current_action_mask)
-                    if isinstance(distribution, MaskableCategoricalDistribution):
-                        policy_probs = distribution.distribution.probs.squeeze(0).cpu().numpy()
-                        policy_probs = np.where(current_action_mask, policy_probs, 0.0)  # Mask illegal actions
-                    else:
-                        policy_probs = np.ones(676, dtype=np.float32)
+            for future in futures:
+                result = future.result()
+                if result["win"]:
+                    wins += 1
+                rewards.append(result["reward"])
+                turns.append(result["turns"])
+                for archetype in result["opp_archetypes"]:
+                    results_by_opp_archetype[archetype].append(1.0 if result["win"] else 0.0)
+                for archetype in result["own_archetypes"]:
+                    results_by_own_archetype[archetype].append(1.0 if result["win"] else 0.0)
 
-                # legal_indices = np.where(current_action_mask)[0]
-                # if len(legal_indices) > 0:
-                #     chosen_action = int(legal_indices[np.argmax(policy_probs[legal_indices])])
-                # else:
-                #     chosen_action = 0
-                
-                search_result = eval_searcher.search(simulated_battle_state, policy_prior=policy_probs)
-                chosen_action = int(min(675, max(0, eval_searcher.to_env_action(search_result.best_action, current_battle))))
-
-                observation, step_reward, is_terminated, is_truncated, _ = self.eval_environment.step(chosen_action)
-                cumulative_reward += float(step_reward)
-                turn_count += 1
-
-            if cumulative_reward > 0:
-                wins += 1
-            rewards.append(cumulative_reward)
-            turns.append(turn_count)
-
-            # Record win rates by opponent and own archetype
-            agent_team, opp_team = self.eval_environment.agent_team, self.eval_environment.opponent_team
-            opp_archetypes = opp_team.archetypes if opp_team else ["Unknown"]
-            own_archetypes = agent_team.archetypes if agent_team else ["Unknown"]
-            for archetype in opp_archetypes:
-                results_by_opp_archetype[archetype].append(1.0 if cumulative_reward > 0 else 0.0)
-            for archetype in own_archetypes:
-                results_by_own_archetype[archetype].append(1.0 if cumulative_reward > 0 else 0.0)
+        if n_episodes == 0:
+            return 0.0, 0.0, 0.0
 
         win_rate = wins / max(1, n_episodes)
         mean_reward = float(np.mean(rewards)) if rewards else 0.0
@@ -481,7 +627,11 @@ class ExpertIterationTrainer:
         print(f"    Archetypes (Opp): {win_rate_by_opp_archetype}")
         print(f"Total Win Rate: {win_rate * 100:.1f}% | Avg Turns: {mean_turns:.1f} | Avg Reward: {mean_reward:+.2f}\n")
         
-        return win_rate, mean_reward, mean_turns
+        return (
+            win_rate,
+            mean_reward,
+            mean_turns
+        )
 
     def learn(
         self,
@@ -498,7 +648,6 @@ class ExpertIterationTrainer:
         self.run_training_loop(
             total_episodes=total_episodes,
             training_steps_per_episode=training_steps_per_episode,
-            checkpoint_frequency=checkpoint_frequency,
             start_episode=start_episode,
         )
         return self
@@ -507,50 +656,56 @@ class ExpertIterationTrainer:
         self,
         total_episodes: int = 1000,
         training_steps_per_episode: int = 2,
-        checkpoint_frequency: int = 50,
         start_episode: int = 1,
     ) -> None:
         """Runs the complete self-play and training loop."""
+        checkpoint_frequency = self.num_workers * 20
+        recent_wins = collections.deque(maxlen=10)
+        recent_episode_lengths = collections.deque(maxlen=10 * self.num_workers)
+        
         print(f"Starting Expert Iteration Training from Episode {start_episode} to {total_episodes} on device: {self.device}")
         print(f"Lookahead Engine: 2-Turn Nash Equilibrium (Simultaneous Matrix Solver)")
         
-        recent_rewards: collections.deque[float] = collections.deque(maxlen=50)
-
-        for episode_index in range(start_episode, total_episodes + 1):
-            episode_reward, episode_length = self.collect_lookahead_episode()
-            recent_rewards.append(episode_reward)
+        for episode_index in range(start_episode, total_episodes + 1, self.num_workers):
+            wins, episode_lengths = self.collect_lookahead_episodes()
+            recent_wins.append(wins)
+            recent_episode_lengths.extend(episode_lengths)
+            win_rate = sum(recent_wins) / (self.num_workers * len(recent_wins)) if recent_wins else 0.0
 
             # Train the network on accumulated lookahead search data
             total_loss, policy_loss, value_loss = 0.0, 0.0, 0.0
             if len(self.replay_buffer) > 1000:
-                for _ in range(training_steps_per_episode):
+                for _ in range(training_steps_per_episode * self.num_workers):
                     step_total, step_pol, step_val = self.train_step()
                     total_loss += step_total
                     policy_loss += step_pol
                     value_loss += step_val
             else:
-                if episode_index % 5 == 0 or episode_index == start_episode:
+                if episode_index % (self.num_workers * 5) == 0 or episode_index == start_episode:
                     print(f"Episode {episode_index}: Not enough data in replay buffer ({len(self.replay_buffer)}) to train.")
 
-            average_total_loss = total_loss / max(1, training_steps_per_episode)
-            average_policy_loss = policy_loss / max(1, training_steps_per_episode)
-            average_value_loss = value_loss / max(1, training_steps_per_episode)
-            win_rate = sum(1 for reward in recent_rewards if reward > 0) / len(recent_rewards)
+            average_total_loss = total_loss / max(1, (training_steps_per_episode * self.num_workers))
+            average_policy_loss = policy_loss / max(1, (training_steps_per_episode * self.num_workers))
+            average_value_loss = value_loss / max(1, (training_steps_per_episode * self.num_workers))
+            average_episode_length = sum(recent_episode_lengths) / max(1, len(recent_episode_lengths))
 
-            if episode_index % 5 == 0 or episode_index == start_episode:
+            if episode_index % (self.num_workers * 5) == 0 or episode_index == start_episode:
                 print(
                     f"Episode {episode_index:4d}/{total_episodes} | "
-                    f"Turns: {episode_length:2d} | "
-                    f"Reward: {episode_reward:+.2f} | "
-                    f"WinRate(last 50): {win_rate * 100:.1f}% | "
+                    f"Average Episode Length (last {self.num_workers * len(recent_wins)}): {average_episode_length:2.1f} | "
+                    f"WinRate (last {self.num_workers * len(recent_wins)}): {win_rate * 100:.1f}% | "
                     f"Buffer: {len(self.replay_buffer):5d} | "
                     f"PolicyLoss: {average_policy_loss:.4f} | "
                     f"ValueLoss: {average_value_loss:.4f} | "
-                    f"ValidationLoss: {self.compute_validation_loss():.4f}"
+                    f"ValidationLoss: {self.compute_validation_loss():.4f} | ",
+                    end=""
                 )
+                if isinstance(self.searcher.evaluator, HybridEvaluator):
+                    print(f"Search Evaluator: Hybrid (Neural Weight: {self.searcher.evaluator.neural_weight:.3f})")
 
             # Checkpoint saving & benchmark validation
-            if episode_index % checkpoint_frequency == 0 or episode_index == total_episodes or episode_index == start_episode:
+            if  episode_index == start_episode or (episode_index == total_episodes or episode_index % checkpoint_frequency == 0 \
+                and len(self.replay_buffer) > 1000):
                 # checkpoint_path = os.path.join(
                 #     self.checkpoint_directory, f"expert_iteration_model_{episode_index}_episodes.zip"
                 # )
@@ -570,7 +725,7 @@ class ExpertIterationTrainer:
                 # Periodic Benchmark Evaluation against SimpleHeuristics baseline
                 if self.eval_environment is not None:
                     print(f"\n>>> [Benchmark Eval @ Ep {episode_index}] vs SimpleHeuristics: ")
-                    eval_win_rate, _, _ = self.evaluate_benchmark(n_episodes=25)
+                    eval_win_rate, _, _ = self.evaluate_benchmark(n_episodes=100)
                     self.best_eval_win_rate = eval_win_rate if episode_index == start_episode else self.best_eval_win_rate
                     if eval_win_rate > self.best_eval_win_rate:
                         self.best_eval_win_rate = eval_win_rate

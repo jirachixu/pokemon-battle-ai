@@ -18,8 +18,7 @@ def _select_teampreview(
     team_preview_encoder: TeamPreviewEncoder,
     team_preview_model: TeamPreviewModel,
     battle: pkmn_b.AbstractBattle,
-    should_track_grad: bool = False,
-) -> tuple[str, dict]:
+) -> tuple[str, int, dict]:
     """
     Uses the TeamPreviewEncoder and the TeamPreviewModel to decide which Pokémon to send out in the first \
     turn of a double battle.
@@ -29,6 +28,7 @@ def _select_teampreview(
     assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
     observation = team_preview_encoder.encode(battle)
     device = next(team_preview_model.parameters()).device
+    cpu_observation = observation.copy()
     observation = {key: value.to(device) for key, value in observation.items()}
     
     # Generate all possible combinations of 4 Pokémon from the 6 brought to battle, 
@@ -39,22 +39,15 @@ def _select_teampreview(
             back = [mon for mon in brought_mons if mon not in leads]
             team_preview_order.append((leads[0], leads[1], back[0], back[1]))
     
-    with torch.set_grad_enabled(team_preview_model.training and should_track_grad):
-        logits, value = team_preview_model(observation)
+    with torch.no_grad():
+        logits, _ = team_preview_model(observation)
         distribution = torch.distributions.Categorical(logits=logits)
         if not team_preview_model.training:
             action_index = torch.argmax(logits)
         else:
-            action_index = distribution.sample()
-        # Policy gradient loss uses log probabilities
-        log_probability = distribution.log_prob(action_index)
-        
+            action_index = distribution.sample()        
         # Used in training to calculate loss and update weights
-        preview_decision = {
-            "log_probability": log_probability,
-            "value": value,
-            "entropy": distribution.entropy(),
-        }
+        preview_decision = int(action_index.item())
     
     lead_0, lead_1, back_0, back_1 = team_preview_order[int(action_index.item())]
     # poke-env expects _selected_in_teampreview to be set for selected Pokemon
@@ -63,7 +56,7 @@ def _select_teampreview(
         if idx < len(team_mons):
             team_mons[idx]._selected_in_teampreview = True
     
-    return f"/team {lead_0 + 1}{lead_1 + 1}{back_0 + 1}{back_1 + 1}", preview_decision
+    return f"/team {lead_0 + 1}{lead_1 + 1}{back_0 + 1}{back_1 + 1}", preview_decision, cpu_observation
 
 class LookaheadPlayer(Player):
     """
@@ -114,7 +107,6 @@ class LookaheadPlayer(Player):
                 self.team_preview_encoder,
                 self.team_preview_model,
                 battle,
-                False,
             )[0]
         return str(super().teampreview(battle))
 
@@ -131,7 +123,8 @@ class RLPlayer(Player):
         self.current_order_future: asyncio.Future | None = None
         self.team_preview_encoder: TeamPreviewEncoder = TeamPreviewEncoder()
         self.team_preview_model: TeamPreviewModel = TeamPreviewModel()
-        self.last_preview_decision = {}
+        self.last_preview_decision: int = -1
+        self.last_teampreview_observation = {}
         
     async def choose_move(self, battle: pkmn_b.AbstractBattle) -> BattleOrder:
         """
@@ -182,11 +175,11 @@ class RLPlayer(Player):
             (e.g., "/team 1234" for selecting Pokemon 1, 2, 3, and 4).
         """
         assert isinstance(battle, pkmn_b.DoubleBattle), "Expected a DoubleBattle instance"
-        selected_team, decision_info = _select_teampreview(
+        selected_team, decision_info, cpu_observation = _select_teampreview(
             self.team_preview_encoder,
             self.team_preview_model,
             battle,
-            self.team_preview_model.training,
         )
         self.last_preview_decision = decision_info
+        self.last_teampreview_observation = cpu_observation
         return selected_team
