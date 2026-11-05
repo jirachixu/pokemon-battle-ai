@@ -135,9 +135,6 @@ def get_move_type_and_bp_boost(
 
     return move_type, bp_boost
 
-
-
-
 def get_dynamic_base_power(
     move: MoveType,
     attacker: PokemonType_,
@@ -189,7 +186,6 @@ def get_dynamic_base_power(
             sim_team = battle.all_team_pokemon() if is_self else battle.all_opponent_pokemon()
             fainted_allies = sum(1 for p in sim_team if p and p.fainted)
         return 50.0 + (50.0 * fainted_allies)
-
 
     if move_id == "ragefist":
         hits = 0
@@ -339,7 +335,6 @@ def get_spread_multiplier(
 
     return 0.75 if alive_targets >= 2 else 1.0
 
-
 def get_attacker_ability_multiplier(
     move: MoveType,
     raw_base_power: float,
@@ -417,7 +412,6 @@ def get_attacker_ability_multiplier(
             sim_team = battle.all_team_pokemon() if is_self else battle.all_opponent_pokemon()
             fainted_count = sum(1 for p in sim_team if p and p.fainted)
         mult *= (1.0 + (0.10 * fainted_count))
-
 
     is_sun = (
         _has_weather(battle, ("sunnyday", "sun", "desolateland")) or
@@ -742,4 +736,3 @@ def evaluate_move_power_and_multipliers(
     eff_damage_2 = (bp_2 * mult_2) / 300.0
 
     return nominal_bp, eff_damage_1, eff_damage_2
-

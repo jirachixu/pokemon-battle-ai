@@ -319,7 +319,7 @@ class ExpertIterationTrainer:
             evaluator=HybridEvaluator(
                 model=model,
                 heuristic_evaluator=self.heuristic_evaluator,
-                neural_weight=0.25,
+                neural_weight=0,
             ),
             depth=search_depth,
             max_candidates=search_candidates_limit,
@@ -336,7 +336,7 @@ class ExpertIterationTrainer:
         self.device = device
         self.best_eval_win_rate = 0.0
         self.generator = np.random.default_rng()
-        self.target_neural_weight = 0.5
+        self.target_neural_weight = 0.25
         self.num_workers = num_workers
 
         os.makedirs(self.checkpoint_directory, exist_ok=True)

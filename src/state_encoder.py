@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from src import constants
 from src.item_priors import ITEM_PRIORS
-from src.damage_calc import evaluate_move_power_and_multipliers, get_move_type_and_bp_boost, clean_str
+from src.damage_calc import evaluate_move_power_and_multipliers, get_dynamic_base_power, get_move_type_and_bp_boost, clean_str
 from src.simulation import SimulatedBattleState, SimulatedPokemon, SimulatedMove
 
 BattleType = Union[pkmn_b.DoubleBattle, SimulatedBattleState]
@@ -222,7 +222,6 @@ class StateEncoder:
         targets = battle.opponent_active_pokemon if is_own else battle.active_pokemon
         target_1 = targets[0] if len(targets) > 0 and targets[0] and not targets[0].fainted else None
         target_2 = targets[1] if len(targets) > 1 and targets[1] and not targets[1].fainted else None
-
         
         for move in pokemon.moves.values():
             category = torch.zeros(3, dtype=torch.float32)
@@ -237,9 +236,11 @@ class StateEncoder:
             if eff_type_clean in constants.TYPE_TO_IDX:
                 move_type[constants.TYPE_TO_IDX[eff_type_clean]] = 1.0
 
-            nominal_bp, effective_damage_1, effective_damage_2 = evaluate_move_power_and_multipliers(
+            _, effective_damage_1, effective_damage_2 = evaluate_move_power_and_multipliers(
                 move, pokemon, target_1, target_2, battle
             )
+            
+            nominal_bp = get_dynamic_base_power(move, pokemon, None, battle)
             
             moves_tensor = torch.cat([
                 torch.tensor([0.0]) if getattr(move, "current_pp", 10) == 0 else torch.tensor([1.0]),
@@ -265,11 +266,11 @@ class StateEncoder:
         Returns:
             torch.Tensor: The encoded tensor for the Pokemon.
         """
-        # [is_present, HP, types, status, boosts, is_first_turn, is_taunted, is_encored, moves, protect_success_rate, 
-        # is_mega, base_stats, eff_speed] 
-        # = 46 + 100 = 146 features    
+        # [is_present, HP, types, status, boosts, is_first_turn, is_taunted, is_encored, is_trapped, perish_turns, 
+        # moves, protect_success_rate, is_mega, base_stats, eff_speed] 
+        # = 48 + 100 = 148 features    
         if not pokemon or pokemon.fainted:
-            return torch.zeros(146, dtype=torch.float32) # If the slot is empty or fainted
+            return torch.zeros(148, dtype=torch.float32) # If the slot is empty or fainted
         
         type_tensor = torch.zeros(18, dtype=torch.float32)
         for pkmn_type in getattr(pokemon, "types", ()):
@@ -353,8 +354,33 @@ class StateEncoder:
         else:
             is_encored = 0.0
         is_encored_tensor = torch.tensor([is_encored], dtype=torch.float32)
+
+        if isinstance(pokemon, SimulatedPokemon):
+            if isinstance(battle, SimulatedBattleState):
+                is_active = pokemon in battle.active_pokemon or pokemon in battle.opponent_active_pokemon
+                is_trapped = 1 if (is_active and battle.is_pokemon_trapped(pokemon)) else 0
+            else:
+                is_trapped = 1 if pokemon.is_trapped else 0
+        else:
+            is_trapped = 1 if (pokemon.effects.get(pkmn_b.Effect.TRAPPED, -1) >= 0 \
+                or pokemon.effects.get(pkmn_b.Effect.BIND, -1) >= 0 \
+                or pokemon.effects.get(pkmn_b.Effect.WRAP, -1) >= 0 \
+                or pokemon.effects.get(pkmn_b.Effect.SAND_TOMB, -1) >= 0) else 0
+        is_trapped_tensor = torch.tensor([is_trapped], dtype=torch.float32)
         
-        
+        if isinstance(pokemon, SimulatedPokemon):
+            perish_turns = pokemon.perish_turns if pokemon.perish_turns is not None else 0
+        else:
+            if pkmn_b.Effect.PERISH3 in pokemon.effects:
+                perish_turns = 3
+            elif pkmn_b.Effect.PERISH2 in pokemon.effects:
+                perish_turns = 2
+            elif pkmn_b.Effect.PERISH1 in pokemon.effects:
+                perish_turns = 1
+            else:
+                perish_turns = 0
+        perish_turns_tensor = torch.tensor([(4 - perish_turns) / 3.0 if perish_turns > 0 else 0.0], dtype=torch.float32)
+
         conds = getattr(battle, "opponent_side_conditions", {}) if opponent else getattr(battle, "side_conditions", {})
         side_conds = {clean_str(c): turn for c, turn in conds.items()}
         
@@ -404,6 +430,8 @@ class StateEncoder:
             is_first_turn,
             is_taunted_tensor,
             is_encored_tensor,
+            is_trapped_tensor,
+            perish_turns_tensor,
             self.encode_moves(pokemon, battle),
             torch.tensor([protect_success_rate, mega_tri_state], dtype=torch.float32),
             base_stats_tensor,
@@ -469,7 +497,7 @@ class StateEncoder:
                 bench_tensors.append(self.encode_single_pokemon(bench[i], battle=battle, opponent=True))
             elif unrevealed_used < unrevealed_alive:
                 # Unrevealed reserve Pokemon in back: alive (is_present=1, hp_frac=1, status=none), species unknown
-                unrevealed_tensor = torch.zeros(146, dtype=torch.float32)
+                unrevealed_tensor = torch.zeros(148, dtype=torch.float32)
                 unrevealed_tensor[0] = 1.0
                 unrevealed_tensor[1] = 1.0
                 unrevealed_tensor[26] = 1.0
@@ -734,6 +762,157 @@ class TeamPreviewEncoder:
     def __init__(self, state_encoder: Optional[StateEncoder] = None):
         self.state_encoder = state_encoder if state_encoder is not None else StateEncoder()
 
+    def encode_moves(self, pokemon: PokemonType_, battle: BattleType) -> torch.Tensor:
+        """
+        Encodes the 4 moves of a Pokemon for Team Preview (Open Team Sheet).
+        Omits mid-battle-only fields (remaining PP and active-target effective damage)
+        and includes spread and priority indicators.
+        # [base_power (1), category (3), type (18), is_spread (1), is_priority (1)] = 24 features per move = 96 for 4
+        """
+        moves_tensors = []
+        ability_id = clean_str(getattr(pokemon, "ability", ""))
+
+        for move in getattr(pokemon, "moves", {}).values():
+            if move is None:
+                continue
+            move_id = clean_str(getattr(move, "id", ""))
+            category = torch.zeros(3, dtype=torch.float32)
+            c_cat = clean_str(getattr(move, "category", ""))
+            cat_idx = constants.CATEGORY_TO_IDX.get(c_cat)
+            if cat_idx is not None:
+                category[cat_idx] = 1.0
+
+            effective_type, __build_class__ = get_move_type_and_bp_boost(move, pokemon, battle)
+            move_type = torch.zeros(18, dtype=torch.float32)
+            eff_type_clean = clean_str(effective_type)
+            if eff_type_clean in constants.TYPE_TO_IDX:
+                move_type[constants.TYPE_TO_IDX[eff_type_clean]] = 1.0
+
+            raw_bp = float(getattr(move, "base_power", 0.0))
+            if raw_bp == 0.0 and c_cat != "status":
+                raw_bp = float(get_dynamic_base_power(move, pokemon, None, battle))
+            nominal_bp = raw_bp
+
+            is_spread = 1.0 if (
+                getattr(move, "is_spread", False)
+                or clean_str(getattr(move, "target", "")) in ("alladjacentfoes", "alladjacent", "foeside")
+            ) else 0.0
+
+            move_priority = int(getattr(move, "priority", 0))
+            is_priority = 1.0 if (
+                (move_priority >= 1 and move_id not in constants.PROTECT_MOVES)
+                or (ability_id == "prankster" and c_cat == "status")
+                or (ability_id == "galewings" and eff_type_clean == "flying")
+                or (ability_id == "triage" and float(getattr(move, "heal", 0.0)) > 0.0)
+                or move_id == "grassyglide"
+            ) else 0.0
+
+            move_tensor = torch.cat([
+                torch.tensor([nominal_bp / 150.0], dtype=torch.float32),
+                category,
+                move_type,
+                torch.tensor([is_spread, is_priority], dtype=torch.float32),
+            ])
+            moves_tensors.append(move_tensor)
+            if len(moves_tensors) == 4:
+                break
+
+        while len(moves_tensors) < 4:
+            moves_tensors.append(torch.zeros(24, dtype=torch.float32))
+
+        return torch.cat(moves_tensors)
+
+    def encode_single_pokemon(self, pokemon: Optional[PokemonType_], battle: BattleType) -> torch.Tensor:
+        # [is_present (1), types (18), moves (96), has_protect (1), can_mega (1),
+        #  base_stats (6), eff_speed (1), ots_role_flags (9)] = 133 features
+        if not pokemon or getattr(pokemon, "fainted", False):
+            return torch.zeros(133, dtype=torch.float32)
+
+        type_tensor = torch.zeros(18, dtype=torch.float32)
+        for pkmn_type in getattr(pokemon, "types", ()):
+            c_t = clean_str(pkmn_type)
+            if c_t in constants.TYPE_TO_IDX:
+                type_tensor[constants.TYPE_TO_IDX[c_t]] = 1.0
+
+        move_ids = {
+            clean_str(getattr(move, "id", ""))
+            for move in getattr(pokemon, "moves", {}).values()
+            if move is not None
+        }
+
+        has_protect = 1.0 if bool(move_ids & constants.PROTECT_MOVES) else 0.0
+
+        item_id = clean_str(getattr(pokemon, "item", ""))
+        species_id = clean_str(getattr(pokemon, "species", ""))
+        expected_mega_stone = constants.MEGA_TO_MEGA_STONE.get(species_id)
+        can_mega = 1.0 if (
+            self.state_encoder.is_mega_evolved(pokemon)
+            or getattr(pokemon, "is_mega", False)
+            or getattr(pokemon, "can_mega_evolve", False)
+            or (expected_mega_stone is not None and item_id == expected_mega_stone)
+            or item_id in constants.MEGA_TO_MEGA_STONE.values()
+        ) else 0.0
+
+        stat_keys = ("atk", "def", "hp", "spa", "spd", "spe")
+        base_stats_tensor = (
+            torch.tensor([float(pokemon.base_stats.get(k, 80)) for k in stat_keys], dtype=torch.float32) / 150.0
+        )
+
+        base_speed = float(pokemon.base_stats.get("spe", 80))
+        speed_mult = 1.0
+        if item_id == "choicescarf":
+            speed_mult *= 1.5
+        elif item_id == "ironball":
+            speed_mult *= 0.5
+        eff_speed = base_speed * speed_mult
+
+        # Open Team Sheet tactical role flags (9 features)
+        has_wide_or_quick_guard = 1.0 if bool(move_ids & {"wideguard", "quickguard", "craftyshield"}) else 0.0
+        has_fake_out = 1.0 if bool(move_ids & {"fakeout", "upperhand", "firstimpression"}) else 0.0
+        has_trick_room = 1.0 if "trickroom" in move_ids else 0.0
+        has_tailwind_or_speed = 1.0 if bool(
+            move_ids & {"tailwind", "icywind", "electroweb", "bulldoze", "scaryface"}
+        ) else 0.0
+        has_redirection = 1.0 if bool(move_ids & {"followme", "ragepowder", "allyswitch"}) else 0.0
+        has_perish_song = 1.0 if "perishsong" in move_ids else 0.0
+        has_sleep_or_status = 1.0 if bool(
+            move_ids & {"spore", "sleeppowder", "yawn", "hypnosis", "darkvoid", "willowisp", "thunderwave", "glare", "nuzzle"}
+        ) else 0.0
+        has_taunt_or_encore = 1.0 if bool(
+            move_ids & {"taunt", "encore", "disable", "imprison", "torment", "throatchop"}
+        ) else 0.0
+        has_setup_or_support = 1.0 if bool(
+            move_ids & {
+                "swordsdance", "nastyplot", "calmmind", "quiverdance", "bulkup", "irondefense",
+                "bellydrum", "shellsmash", "dragondance", "tailglow", "clangoroussoul", "victorydance",
+                "shiftgear", "coil", "curse", "cosmicpower", "helpinghand", "coaching", "decorate",
+                "howl", "partingshot", "chillyreception", "pollenpuff", "floralhealing", "healpulse",
+                "lifedew", "lunarblessing", "haze", "clearsmog", "sunnyday", "raindance", "sandstorm", "snowscape"
+            }
+        ) else 0.0
+
+        ots_role_flags = torch.tensor([
+            has_wide_or_quick_guard,
+            has_fake_out,
+            has_trick_room,
+            has_tailwind_or_speed,
+            has_redirection,
+            has_perish_song,
+            has_sleep_or_status,
+            has_taunt_or_encore,
+            has_setup_or_support,
+        ], dtype=torch.float32)
+
+        return torch.cat([
+            torch.tensor([1.0], dtype=torch.float32),
+            type_tensor,
+            self.encode_moves(pokemon, battle),
+            torch.tensor([has_protect, can_mega], dtype=torch.float32),
+            base_stats_tensor,
+            torch.tensor([max(-1.0, min(1.0, eff_speed / 500.0))], dtype=torch.float32),
+            ots_role_flags,
+        ])
+
     def encode(self, battle: BattleType) -> dict[str, torch.Tensor]:
         """
         Generates the encoding tensors for the team preview state of the battle.
@@ -755,12 +934,12 @@ class TeamPreviewEncoder:
         items_list = []
         
         for mon in all_mons:
-            numeric_list.append(self.state_encoder.encode_single_pokemon(mon, battle)) # (142,)
-            abilities_list.append(self.state_encoder.encode_single_ability(mon))        # (215,)
-            items_list.append(self.state_encoder.encode_single_item(mon))               # (167,)
+            numeric_list.append(self.encode_single_pokemon(mon, battle))          # (133,)
+            abilities_list.append(self.state_encoder.encode_single_ability(mon))  # (215,)
+            items_list.append(self.state_encoder.encode_single_item(mon))         # (167,)
 
         return {
-            "numeric": torch.cat(numeric_list),       # Shape: (12 * 142,) = (1704,)
+            "numeric": torch.cat(numeric_list),       # Shape: (12 * 133,) = (1596,)
             "abilities": torch.stack(abilities_list), # Shape: (12, 215)
             "items": torch.stack(items_list),         # Shape: (12, 167)
         }
