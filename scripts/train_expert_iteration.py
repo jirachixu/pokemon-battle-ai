@@ -302,7 +302,7 @@ class ExpertIterationTrainer:
         search_candidates_limit: int = 9,
         replay_buffer_capacity: int = 15000,
         learning_rate: float = 3e-5,
-        batch_size: int = 64,
+        batch_size: int = 128,
         policy_loss_weight: float = 1.0,
         value_loss_weight: float = 0.5,
         entropy_weight: float = 0.01,
@@ -349,6 +349,13 @@ class ExpertIterationTrainer:
             self.optimizer = None
             self.preview_optimizer = None
         
+        # Set up learning rate schedulers for both the main model and the preview model to gradually reduce the 
+        # learning rate over time, which can help stabilize training and improve convergence.
+        if self.optimizer is not None:
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=15000, eta_min=3e-6)
+        if self.preview_optimizer is not None:
+            self.preview_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.preview_optimizer, T_max=15000, eta_min=3e-6)
+
     def collect_lookahead_episodes(self) -> tuple[int, list[int]]:
         """
         Plays a full battle where every decision is computed by the 2-turn lookahead search.
@@ -386,6 +393,8 @@ class ExpertIterationTrainer:
                     futures.append(future)
                     time.sleep(0.2) # prevent all workers from starting at the exact same time, which can cause memory issues
 
+                # Zero gradients for the preview model before accumulating gradients from all workers
+                self.preview_optimizer.zero_grad()
                 for future in futures:
                     result = future.result()
                     if result["win"]:
@@ -415,9 +424,9 @@ class ExpertIterationTrainer:
                     entropy_loss = -0.01 * entropy
                     preview_loss = policy_loss + value_loss + entropy_loss
                     
-                    self.preview_optimizer.zero_grad()
-                    preview_loss.backward()
-                    self.preview_optimizer.step()
+                    # self.preview_optimizer.zero_grad()
+                    # preview_loss.backward()
+                    # self.preview_optimizer.step()
                     
                     if isinstance(self.searcher.evaluator, HybridEvaluator):
                         self.searcher.evaluator.neural_weight += 0.002 * (self.target_neural_weight - self.searcher.evaluator.neural_weight)
@@ -439,6 +448,7 @@ class ExpertIterationTrainer:
                         )
 
                     episode_lengths.append(len(episode_transitions))
+                    (preview_loss / len(futures)).backward()  # Accumulate gradients for the preview model across all workers
             except KeyboardInterrupt:
                 print("Training interrupted by user. Terminating all workers gracefully...")
                 for pid in list(executor._processes.keys()):
@@ -448,6 +458,9 @@ class ExpertIterationTrainer:
                         print(f"Error terminating process {pid}: {e}")
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise
+        
+        torch.nn.utils.clip_grad_norm_(self.preview_model.parameters(), max_norm=0.5)
+        self.preview_optimizer.step()
         
         gc.collect()
         if torch.cuda.is_available():
@@ -644,7 +657,7 @@ class ExpertIterationTrainer:
         win_rate_by_opp_archetype = {archetype: np.mean(results) for archetype, results in results_by_opp_archetype.items()}
         win_rate_by_own_archetype = {archetype: np.mean(results) for archetype, results in results_by_own_archetype.items()}
         
-        if min(win_rate_by_opp_archetype.values()) >= 0.8 and min(win_rate_by_own_archetype.values()) >= 0.8:
+        if min(win_rate_by_opp_archetype.values()) >= 0.7 and min(win_rate_by_own_archetype.values()) >= 0.7 and win_rate >= 0.8:
             self.target_neural_weight = min(1.0, self.target_neural_weight + 0.25)
         
         print(f"    Archetypes (Own): {win_rate_by_own_archetype}")
@@ -656,7 +669,7 @@ class ExpertIterationTrainer:
     def learn(
         self,
         total_episodes: int = 1000,
-        training_steps_per_episode: int = 2,
+        training_steps_per_episode: int = 1,
         start_episode: int = 1,
     ) -> "ExpertIterationTrainer":
         """Runs the complete self-play and training loop (AlphaZero / Expert Iteration).
@@ -674,7 +687,7 @@ class ExpertIterationTrainer:
     def run_training_loop(
         self,
         total_episodes: int = 1000,
-        training_steps_per_episode: int = 2,
+        training_steps_per_episode: int = 1,
         start_episode: int = 1,
     ) -> None:
         """Runs the complete self-play and training loop."""
@@ -699,8 +712,11 @@ class ExpertIterationTrainer:
                     total_loss += step_total
                     policy_loss += step_pol
                     value_loss += step_val
+                    if isinstance(self.searcher.evaluator, HybridEvaluator) and self.searcher.evaluator.neural_weight >= 0.95:
+                        self.scheduler.step()
+                        self.preview_scheduler.step()
             else:
-                if episode_index % (self.num_workers * 5) == 0 or episode_index == start_episode:
+                if episode_index % (self.num_workers * 5) == 1 or episode_index == start_episode:
                     print(f"Episode {episode_index}: Not enough data in replay buffer ({len(self.replay_buffer)}) to train.")
 
             average_total_loss = total_loss / max(1, (training_steps_per_episode * self.num_workers))
@@ -708,7 +724,7 @@ class ExpertIterationTrainer:
             average_value_loss = value_loss / max(1, (training_steps_per_episode * self.num_workers))
             average_episode_length = sum(recent_episode_lengths) / max(1, len(recent_episode_lengths))
 
-            if episode_index % (self.num_workers * 5) == 0 or episode_index == start_episode:
+            if episode_index % (self.num_workers * 5) == 1 or episode_index == start_episode:
                 print(
                     f"Episode {episode_index:4d}/{total_episodes} | "
                     f"Average Episode Length (last {self.num_workers * len(recent_wins)}): {average_episode_length:2.1f} | "
@@ -723,7 +739,7 @@ class ExpertIterationTrainer:
                     print(f"Search Evaluator: Hybrid (Neural Weight: {self.searcher.evaluator.neural_weight:.3f})")
 
             # Checkpoint saving & benchmark validation
-            if  episode_index == start_episode or (episode_index == total_episodes or episode_index % checkpoint_frequency == 0 \
+            if  episode_index == start_episode or (episode_index == total_episodes or episode_index % checkpoint_frequency == 1 \
                 and len(self.replay_buffer) > 1000):
                 # checkpoint_path = os.path.join(
                 #     self.checkpoint_directory, f"expert_iteration_model_{episode_index}_episodes.zip"
@@ -807,6 +823,8 @@ def main():
             verbose=1,
         )
 
+    raw_environment.close()  # Close the raw environment to free resources, as it will be recreated in parallel workers
+
     trainer = ExpertIterationTrainer(
         model=ppo_model,
         preview_model=preview_model,
@@ -814,7 +832,7 @@ def main():
         search_candidates_limit=9,
         replay_buffer_capacity=30000,
         learning_rate=3e-5,
-        batch_size=64,
+        batch_size=128,
         policy_loss_weight=1.0,
         value_loss_weight=0.5,
         entropy_weight=0.01,
@@ -825,7 +843,7 @@ def main():
 
     trainer.learn(
         total_episodes=15000,
-        training_steps_per_episode=2,
+        training_steps_per_episode=1,
         start_episode=start_episode,
     )
 
