@@ -690,19 +690,55 @@ def get_effective_damage_multiplier(
 
     mult *= get_target_defense_multiplier(move, move_type, attacker, target, battle, type_mult)
     mult *= get_held_item_multiplier(move, move_type, attacker, target, type_mult)
+
+    # Physical burn penalty (0.5x unless Guts or Facade)
+    attacker_status = clean_str(getattr(attacker, "status", None))
+    if not is_special and attacker_status in ("brn", "burn") and attacker_ability != "guts" and move_id != "facade":
+        mult *= 0.5
+
+    # Stat ratio & stat stage boosts (accounting for Body Press, Foul Play, Psyshock, and Unaware)
+    atk_holder = target if move_id == "foulplay" else attacker
+    atk_stat_key = "def" if move_id == "bodypress" else ("spa" if is_special else "atk")
+    def_stat_key = "def" if (not is_special or move_id in ("psyshock", "psystrike", "secretsword")) else "spd"
+
+    def _get_stat_value(mon: PokemonType_, key: str) -> float:
+        raw_stats = getattr(mon, "stats", None)
+        if isinstance(raw_stats, dict) and raw_stats.get(key) is not None and float(raw_stats[key]) > 0:
+            return float(raw_stats[key])
+        base_dict = getattr(mon, "base_stats", {}) or {}
+        base_val = float(base_dict.get(key, 80))
+        return base_val + 20.0  # Level 50 neutral stat approximation from base stat
+
+    atk_stat_val = _get_stat_value(atk_holder, atk_stat_key)
+    def_stat_val = max(1.0, _get_stat_value(target, def_stat_key))
+
+    ignore_atk_boosts = (not ignores_ability and target_ability == "unaware")
+    ignore_def_boosts = (attacker_ability == "unaware")
+    is_guaranteed_crit = move_id in ("surgingstrikes", "wickedblow", "flowertrick", "stormthrow", "frostbreath")
+
+    atk_boost = 0 if ignore_atk_boosts else int((getattr(atk_holder, "boosts", {}) or {}).get(atk_stat_key, 0))
+    def_boost = 0 if ignore_def_boosts else int((getattr(target, "boosts", {}) or {}).get(def_stat_key, 0))
+    if is_guaranteed_crit:
+        atk_boost = max(0, atk_boost)
+        def_boost = min(0, def_boost)
+
+    atk_stage_mult = (2.0 + atk_boost) / 2.0 if atk_boost >= 0 else 2.0 / (2.0 - atk_boost)
+    def_stage_mult = (2.0 + def_boost) / 2.0 if def_boost >= 0 else 2.0 / (2.0 - def_boost)
+
+    mult *= (atk_stat_val * atk_stage_mult) / max(1.0, def_stat_val * def_stage_mult)
     
     target_is_opponent = target not in battle.active_pokemon
     side_conditions = battle.opponent_side_conditions if target_is_opponent else battle.side_conditions
-    if not attacker_ability == "infiltrator":
+    if attacker_ability != "infiltrator" and not is_guaranteed_crit and move_id not in ("brickbreak", "psychicfangs", "ragingbull"):
         if isinstance(battle, pkmn_b.DoubleBattle):
-            if c_category == "physical" and pkmn_b.SideCondition.REFLECT in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions:
+            if c_category == "physical" and (pkmn_b.SideCondition.REFLECT in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions):
                 mult *= (2 / 3)
-            elif c_category == "special" and pkmn_b.SideCondition.LIGHT_SCREEN in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions:
+            elif c_category == "special" and (pkmn_b.SideCondition.LIGHT_SCREEN in side_conditions or pkmn_b.SideCondition.AURORA_VEIL in side_conditions):
                 mult *= (2 / 3)
         elif isinstance(battle, SimulatedBattleState):
-            if c_category == "physical" and "reflect" in side_conditions or "auroraveil" in side_conditions:
+            if c_category == "physical" and ("reflect" in side_conditions or "auroraveil" in side_conditions):
                 mult *= (2 / 3)
-            elif c_category == "special" and "lightscreen" in side_conditions or "auroraveil" in side_conditions:
+            elif c_category == "special" and ("lightscreen" in side_conditions or "auroraveil" in side_conditions):
                 mult *= (2 / 3)
 
     return mult

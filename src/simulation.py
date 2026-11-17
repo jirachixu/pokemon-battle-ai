@@ -657,10 +657,11 @@ class SimulatedPokemon:
             is_mega = cleaned_species.endswith(("mega", "megax", "megay", "megaz")) and cleaned_species != "yanmega"
             weight = float(pokedex_data.get("weightkg", 50.0))
             ability = clean_id(revealed_ability or "")
-            if not ability and "abilities" in pokedex_data:
-                ability = clean_id(pokedex_data["abilities"].get("0", "none"))
+            if ability in ("none", "unknownability"):
+                ability = ""
 
-        item = clean_id(revealed_item or "none")
+        item_unrevealed = (revealed_item is None or clean_id(revealed_item) == "unknownitem")
+        item = "none" if item_unrevealed else (clean_id(revealed_item) or "none")
         spread = meta_priors.get_champions_common_spread(cleaned_species) if fill_champions_priors else {"nature": "hardy", "evs": {}}
 
         # Empirical Champions Reg M-C prior inference for missing attributes
@@ -669,10 +670,15 @@ class SimulatedPokemon:
                 ability_priors = meta_priors.get_champions_ability_priors(cleaned_species)
                 if ability_priors:
                     ability = sorted(ability_priors.items(), key=lambda prior_pair: prior_pair[1], reverse=True)[0][0]
-            if not item or item == "none":
+            if item_unrevealed:
                 item_priors = meta_priors.get_champions_item_priors(cleaned_species)
                 if item_priors:
                     item = sorted(item_priors.items(), key=lambda prior_pair: prior_pair[1], reverse=True)[0][0]
+
+        if not ability and not is_mega:
+            pokedex_data = _POKEDEX_CACHE.get(cleaned_species, {})
+            if "abilities" in pokedex_data:
+                ability = clean_id(pokedex_data["abilities"].get("0", "none"))
 
         # Determine moveset
         moves_dictionary = {}
@@ -1403,12 +1409,15 @@ class SimulatedBattleState:
         for move_id, move_object in getattr(mon, "moves", {}).items():
             moves_dictionary[clean_id(move_id)] = SimulatedMove.from_id(move_id)
 
+        raw_mon_item = getattr(mon, "item", "unknown_item")
+        revealed_item_arg = None if clean_id(raw_mon_item) == "unknownitem" else (clean_id(raw_mon_item) or "none")
+
         simulated_pokemon = SimulatedPokemon.from_species(
             species=species_name,
             side=side,
             slot=slot,
             revealed_moves=list(moves_dictionary.keys()),
-            revealed_item=clean_id(getattr(mon, "item", None)),
+            revealed_item=revealed_item_arg,
             revealed_ability=clean_id(getattr(mon, "ability", None)),
             fill_champions_priors=fill_priors,
         )
@@ -1810,6 +1819,19 @@ def step_simulation(
     5. End of turn status damage, weather damage, passive recovery, field timer countdowns.
     """
     next_state = state.clone()
+    player1_actions = [action_player1] if isinstance(action_player1, SimulatedAction) else list(action_player1)
+    player2_actions = [action_player2] if isinstance(action_player2, SimulatedAction) else list(action_player2)
+
+    # Free replacement switch phase (post-KO / pivot force_switch):
+    # Only execute replacement switches and entry hazards/abilities without advancing turn timers or end-of-turn effects.
+    if any(state.force_switch):
+        next_state.force_switch = [False, False]
+        _execute_switches(next_state, player1_actions, side=1, ignore_trapping=True)
+        _execute_switches(next_state, player2_actions, side=2, ignore_trapping=True)
+        _sync_neutralizing_gas(next_state)
+        _check_paradox_abilities(next_state)
+        return next_state
+
     next_state.turn += 1
     next_state.redirect_target = {1: None, 2: None}
     next_state.wide_guard = {1: False, 2: False}
@@ -1829,9 +1851,6 @@ def step_simulation(
             active_pkmn.took_damage_this_turn = False
             active_pkmn.moved_this_turn = False
             active_pkmn.switched_in_this_turn = False
-
-    player1_actions = [action_player1] if isinstance(action_player1, SimulatedAction) else list(action_player1)
-    player2_actions = [action_player2] if isinstance(action_player2, SimulatedAction) else list(action_player2)
 
     # Reset protect streak for slots that pass
     for action in player1_actions:
@@ -2784,6 +2803,8 @@ def _execute_switches(
                     switched_out_pokemon.consecutive_move_uses = 0
                     switched_out_pokemon.slot = -1
                     bench_pokemon_list[action.switch_idx] = switched_out_pokemon
+                else:
+                    bench_pokemon_list[action.switch_idx] = None  # type: ignore[assignment]
 
                 switched_in_pokemon.first_turn = True
                 switched_in_pokemon.switched_in_this_turn = True
@@ -2806,6 +2827,7 @@ def _execute_switches(
                 if not switched_in_pokemon.fainted:
                     _trigger_entry_abilities(switched_in_pokemon, state)
 
+    bench_pokemon_list[:] = [p for p in bench_pokemon_list if p is not None and not p.fainted]
 
 def _trigger_mega(pokemon: Optional[SimulatedPokemon], state: Optional[SimulatedBattleState] = None) -> None:
     if not pokemon or pokemon.is_mega or pokemon.fainted:
@@ -4973,6 +4995,20 @@ def _replace_fainted_slots(state: SimulatedBattleState, side: int) -> None:
                     replacement_pokemon = candidate_bench_pokemon
                     bench_pokemon_list.pop(bench_index)
                     break
+            if replacement_pokemon is None and side == 2 and state.unrevealed_opponent_count > 0:
+                state.unrevealed_opponent_count -= 1
+                replacement_pokemon = SimulatedPokemon(
+                    species="unrevealed",
+                    side=2,
+                    slot=slot_index,
+                    types=(),
+                    base_stats={"hp": 85, "atk": 85, "def": 85, "spa": 85, "spd": 85, "spe": 85},
+                    hp=160.0,
+                    max_hp=160.0,
+                    ability="",
+                    item="",
+                    moves={},
+                )
             if replacement_pokemon:
                 replacement_pokemon.slot = slot_index
                 replacement_pokemon.first_turn = True

@@ -96,7 +96,7 @@ class CompetitiveHeuristicEvaluator(BattleStateEvaluator):
         is_trick_room_active = "trickroom" in state.fields
         team_tailwind_turns = state.side_conditions.get("tailwind", 0)
         opp_tailwind_turns = state.opponent_side_conditions.get("tailwind", 0)
-        evaluation_score += self.weight_speed_control * (team_tailwind_turns - opp_tailwind_turns)
+        evaluation_score += (self.weight_speed_control * (team_tailwind_turns - opp_tailwind_turns)) / 4.0
 
         # Active speed order comparison
         team_living_active = [pokemon for pokemon in state.active_pokemon if pokemon and not pokemon.fainted]
@@ -538,8 +538,10 @@ class HybridEvaluator(BattleStateEvaluator):
         self.neural_weight = neural_weight if self.neural_evaluator else 0.0
 
     def evaluate_batch(self, states: List[SimulatedBattleState]) -> torch.Tensor:
+        if self.neural_evaluator and self.neural_weight >= 1.0:
+            return self.neural_evaluator.evaluate(states)
         heuristic_scores = self.heuristic_evaluator.evaluate(states)
-        heuristic_normalized = torch.tanh(heuristic_scores / 8000.0)
+        heuristic_normalized = torch.tanh(heuristic_scores / 3000.0)
         if self.neural_evaluator and self.neural_weight > 0.0:
             neural_scores = self.neural_evaluator.evaluate(states).to(heuristic_normalized.device)
             return (1.0 - self.neural_weight) * heuristic_normalized + (self.neural_weight * neural_scores)

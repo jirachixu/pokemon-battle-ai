@@ -5,8 +5,9 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 class VGCFeatureExtractor(BaseFeaturesExtractor):
     # ability_dim is a kwarg that can be specified when creating the policy
     def __init__(self, observation_space, ability_dim: int = 32, item_dim: int = 32):
-        # 1199 for the main features + 8 abilities each of size ability_dim + 8 items each of size item_dim
-        features_dim = 1199 + (8 * ability_dim) + (8 * item_dim)
+        numeric_dim = int(observation_space["numeric"].shape[0])
+        # numeric_dim for the main features + 8 abilities each of size ability_dim + 8 items each of size item_dim
+        features_dim = numeric_dim + (8 * ability_dim) + (8 * item_dim)
         super().__init__(observation_space, features_dim)
         # No bias to preserve 0 probability for impossible abilities
         self.ability_embedding = nn.Linear(215, ability_dim, bias=False)

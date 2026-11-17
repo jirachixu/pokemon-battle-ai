@@ -32,10 +32,10 @@ setattr(pkmn_b.Pokemon, "unburden_active", property(_get_unburden_active, _set_u
 # Hook to detect used items
 _original_end_item = pkmn_b.Pokemon.end_item
 def _patched_end_item(self, item: str):
-    self.item = "none"
     if clean_str(getattr(self, "ability", "")) == "unburden":
         self.unburden_active = True
     _original_end_item(self, item)
+    self.item = "none"
     
 _original_switch_out = pkmn_b.Pokemon.switch_out
 def _patched_switch_out(self, fields):
@@ -210,7 +210,10 @@ class StateEncoder:
         Returns:
             torch.Tensor: A tensor representing the encoded moves of the Pokemon.
         """
-        # [is_available (1), base_power (1), category (3), type (18), effective_damage (2)] = 25 features per move = 100 for 4
+        # [is_available (1), base_power (1), category (3), type (18), effective_damage (2),
+        #  tactical_flags (7: is_spread, is_priority, is_protect_or_guard, is_speed_control,
+        #                  is_redirection, is_status_or_disruption, is_setup_or_support)]
+        # = 32 features per move = 128 for 4
         moves_tensors = []
         if isinstance(pokemon, SimulatedPokemon):
             is_own = (pokemon.side == 1)
@@ -222,8 +225,10 @@ class StateEncoder:
         targets = battle.opponent_active_pokemon if is_own else battle.active_pokemon
         target_1 = targets[0] if len(targets) > 0 and targets[0] and not targets[0].fainted else None
         target_2 = targets[1] if len(targets) > 1 and targets[1] and not targets[1].fainted else None
+        ability_id = clean_str(getattr(pokemon, "ability", ""))
         
         for move in pokemon.moves.values():
+            move_id = clean_str(getattr(move, "id", ""))
             category = torch.zeros(3, dtype=torch.float32)
             c_cat = clean_str(getattr(move, "category", ""))
             cat_idx = constants.CATEGORY_TO_IDX.get(c_cat)
@@ -241,19 +246,65 @@ class StateEncoder:
             )
             
             nominal_bp = get_dynamic_base_power(move, pokemon, None, battle)
+
+            is_spread = 1.0 if (
+                getattr(move, "is_spread", False)
+                or clean_str(getattr(move, "target", "")) in ("alladjacentfoes", "alladjacent", "foeside")
+            ) else 0.0
+
+            move_priority = int(getattr(move, "priority", 0))
+            is_priority = 1.0 if (
+                (move_priority >= 1 and move_id not in constants.PROTECT_MOVES)
+                or (ability_id == "prankster" and c_cat == "status")
+                or (ability_id == "galewings" and eff_type_clean == "flying")
+                or (ability_id == "triage" and float(getattr(move, "heal", 0.0)) > 0.0)
+                or move_id == "grassyglide"
+            ) else 0.0
+
+            is_protect_or_guard = 1.0 if (
+                move_id in constants.PROTECT_MOVES
+                or move_id in ("wideguard", "quickguard", "craftyshield", "endure")
+            ) else 0.0
+            is_speed_control = 1.0 if move_id in (
+                "trickroom", "tailwind", "icywind", "electroweb", "bulldoze", "scaryface", "thunderwave", "glare"
+            ) else 0.0
+            is_redirection = 1.0 if move_id in ("followme", "ragepowder", "allyswitch") else 0.0
+            is_status_or_disruption = 1.0 if move_id in (
+                "spore", "sleeppowder", "yawn", "hypnosis", "darkvoid", "willowisp", "toxic", "nuzzle",
+                "taunt", "encore", "disable", "imprison", "torment", "perishsong", "partingshot",
+                "snarl", "faketears", "screech", "haze", "clearsmog"
+            ) else 0.0
+            is_setup_or_support = 1.0 if move_id in (
+                "swordsdance", "nastyplot", "calmmind", "dragondance", "bulkup", "quiverdance",
+                "irondefense", "shellsmash", "bellydrum", "geomancy", "shiftgear", "tidyup",
+                "victorydance", "coil", "helpinghand", "coaching", "decorate", "howl", "substitute",
+                "recover", "roost", "slackoff", "softboiled", "milkdrink", "synthesis", "moonlight",
+                "morningsun", "strengthsap", "wish", "lifedew", "pollenpuff", "floralhealing",
+                "healpulse", "lunarblessing", "chillyreception"
+            ) else 0.0
             
             moves_tensor = torch.cat([
                 torch.tensor([0.0]) if getattr(move, "current_pp", 10) == 0 else torch.tensor([1.0]),
                 torch.tensor([nominal_bp / 150.0]),
                 category,
                 move_type,
-                torch.tensor([effective_damage_1, effective_damage_2], dtype=torch.float32)
+                torch.tensor([
+                    effective_damage_1,
+                    effective_damage_2,
+                    is_spread,
+                    is_priority,
+                    is_protect_or_guard,
+                    is_speed_control,
+                    is_redirection,
+                    is_status_or_disruption,
+                    is_setup_or_support,
+                ], dtype=torch.float32)
             ])
             
             moves_tensors.append(moves_tensor)
 
         while len(moves_tensors) < 4:
-            moves_tensors.append(torch.zeros(25, dtype=torch.float32))
+            moves_tensors.append(torch.zeros(32, dtype=torch.float32))
 
         return torch.cat(moves_tensors)
 
@@ -268,9 +319,12 @@ class StateEncoder:
         """
         # [is_present, HP, types, status, boosts, is_first_turn, is_taunted, is_encored, is_trapped, perish_turns, 
         # moves, protect_success_rate, is_mega, base_stats, eff_speed] 
-        # = 48 + 100 = 148 features    
+        # = 48 + 128 = 176 features    
         if not pokemon or pokemon.fainted:
-            return torch.zeros(148, dtype=torch.float32) # If the slot is empty or fainted
+            return torch.zeros(176, dtype=torch.float32) # If the slot is empty or fainted
+        if clean_str(getattr(pokemon, "species", "")) == "unrevealed":
+            hp_frac = getattr(pokemon, "current_hp_fraction", 1.0)
+            return self._make_unrevealed_pokemon_tensor(float(hp_frac) if hp_frac is not None else 1.0)
         
         type_tensor = torch.zeros(18, dtype=torch.float32)
         for pkmn_type in getattr(pokemon, "types", ()):
@@ -466,11 +520,36 @@ class StateEncoder:
 
         return torch.cat(bench_tensors)
     
-    def encode_opponent_bench(self, battle: BattleType) -> torch.Tensor:
+    def _make_unrevealed_pokemon_tensor(self, hp_frac: float = 1.0) -> torch.Tensor:
+        """Creates a placeholder tensor for an alive, unrevealed opponent Pokemon (is_present=1, hp_frac=hp_frac, status=none)."""
+        unrevealed_tensor = torch.zeros(176, dtype=torch.float32)
+        unrevealed_tensor[0] = 1.0
+        unrevealed_tensor[1] = float(hp_frac)
+        unrevealed_tensor[26] = 1.0
+        return unrevealed_tensor
+
+    def _get_unrevealed_opponent_alive(self, battle: BattleType) -> int:
+        """Returns the number of alive unrevealed reserve Pokemon for the opponent."""
+        if isinstance(battle, pkmn_b.DoubleBattle):
+            bench = [
+                pokemon for pokemon in battle.opponent_team.values()
+                if pokemon is not None
+                and not pokemon.fainted
+                and pokemon not in battle.opponent_active_pokemon
+                and getattr(pokemon, "revealed", False)
+            ]
+            opp_fainted = sum(1 for p in battle.opponent_team.values() if p is not None and p.fainted)
+            opp_active_alive = sum(1 for p in battle.opponent_active_pokemon if p is not None and not p.fainted)
+            opp_brought_cap = min(4, max(len(battle.opponent_team), opp_active_alive + len(bench) + opp_fainted))
+            return max(0, opp_brought_cap - opp_fainted - opp_active_alive - len(bench))
+        return int(getattr(battle, "unrevealed_opponent_count", 0))
+
+    def encode_opponent_bench(self, battle: BattleType, unrevealed_promoted: int = 0) -> torch.Tensor:
         """
         Generates the encoding vector for the opponent's bench (non-active Pokémon).
         Args:
             battle (BattleType): The battle object containing the current state.
+            unrevealed_promoted (int): Number of unrevealed reserve Pokemon already promoted into fainted active slots.
         Returns:
             torch.Tensor: The encoded tensor for the opponent's bench.
         """
@@ -482,13 +561,10 @@ class StateEncoder:
                 and pokemon not in battle.opponent_active_pokemon 
                 and getattr(pokemon, "revealed", False)
             ]
-            opp_fainted = sum(1 for p in battle.opponent_team.values() if p is not None and p.fainted)
-            opp_active_alive = sum(1 for p in battle.opponent_active_pokemon if p is not None and not p.fainted)
-            opp_brought_cap = min(4, max(len(battle.opponent_team), opp_active_alive + len(bench) + opp_fainted))
-            unrevealed_alive = max(0, opp_brought_cap - opp_fainted - opp_active_alive - len(bench))
         else:
             bench = [p for p in battle.opponent_bench if p is not None and not p.fainted]
-            unrevealed_alive = getattr(battle, "unrevealed_opponent_count", 0)
+
+        unrevealed_alive = max(0, self._get_unrevealed_opponent_alive(battle) - unrevealed_promoted)
 
         bench_tensors = []
         unrevealed_used = 0
@@ -496,12 +572,7 @@ class StateEncoder:
             if i < len(bench):
                 bench_tensors.append(self.encode_single_pokemon(bench[i], battle=battle, opponent=True))
             elif unrevealed_used < unrevealed_alive:
-                # Unrevealed reserve Pokemon in back: alive (is_present=1, hp_frac=1, status=none), species unknown
-                unrevealed_tensor = torch.zeros(148, dtype=torch.float32)
-                unrevealed_tensor[0] = 1.0
-                unrevealed_tensor[1] = 1.0
-                unrevealed_tensor[26] = 1.0
-                bench_tensors.append(unrevealed_tensor)
+                bench_tensors.append(self._make_unrevealed_pokemon_tensor())
                 unrevealed_used += 1
             else:
                 bench_tensors.append(self.encode_single_pokemon(None, battle=battle, opponent=True))
@@ -598,7 +669,7 @@ class StateEncoder:
             torch.Tensor: A tensor representing the encoded item of the Pokemon.
         """
         vec = torch.zeros(167, dtype=torch.float32)
-        if not pokemon or pokemon.fainted:
+        if not pokemon or pokemon.fainted or clean_str(getattr(pokemon, "species", "")) == "unrevealed":
             return vec
         
         raw_item = pokemon.item
@@ -738,13 +809,19 @@ class StateEncoder:
         active_pokemon = torch.cat(active_tensors)
 
         opp_active_tensors = []
+        unrevealed_alive = self._get_unrevealed_opponent_alive(battle)
+        unrevealed_promoted = 0
         for i in range(2):
             mon = battle.opponent_active_pokemon[i] if i < len(battle.opponent_active_pokemon) else None
-            opp_active_tensors.append(self.encode_single_pokemon(mon, battle=battle, opponent=True))
+            if (mon is None or mon.fainted) and unrevealed_promoted < unrevealed_alive:
+                opp_active_tensors.append(self._make_unrevealed_pokemon_tensor())
+                unrevealed_promoted += 1
+            else:
+                opp_active_tensors.append(self.encode_single_pokemon(mon, battle=battle, opponent=True))
         opp_active_pokemon = torch.cat(opp_active_tensors)
 
         bench = self.encode_bench(battle)
-        opp_bench = self.encode_opponent_bench(battle)
+        opp_bench = self.encode_opponent_bench(battle, unrevealed_promoted=unrevealed_promoted)
         
         return {
             "numeric": torch.cat([

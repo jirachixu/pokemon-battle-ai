@@ -146,7 +146,7 @@ class SearchResult:
     """Encapsulates the result of a multi-turn lookahead search."""
     __slots__ = (
         "best_action", "value", "action_distribution", "predicted_opponent_actions",
-        "depth", "nodes_evaluated", "method"
+        "depth", "nodes_evaluated", "method", "leaf_samples"
     )
 
     best_action: tuple[SimulatedAction, SimulatedAction]
@@ -156,6 +156,7 @@ class SearchResult:
     depth: int
     nodes_evaluated: int
     method: str
+    leaf_samples: list[tuple[SimulatedBattleState, float]]
 
     def __init__(
         self,
@@ -166,6 +167,7 @@ class SearchResult:
         depth: int,
         nodes_evaluated: int,
         method: str = "nash",
+        leaf_samples: Optional[list[tuple[SimulatedBattleState, float]]] = None,
     ) -> None:
         self.best_action = best_action
         self.value = value
@@ -174,6 +176,7 @@ class SearchResult:
         self.depth = depth
         self.nodes_evaluated = nodes_evaluated
         self.method = method
+        self.leaf_samples = leaf_samples if leaf_samples is not None else []
 
     def __repr__(self) -> str:
         return (
@@ -293,7 +296,7 @@ class LookaheadSearch:
                     slot1_code = self._slot_action_to_int(action_slot1, slot_index=1, battle=raw_battle_ref)
                     action_code = int(min(675, max(0, slot0_code * 26 + slot1_code)))
                     if 0 <= action_code < len(policy_prior):
-                        joint_score += 25.0 * float(policy_prior[action_code])
+                        joint_score += 65.0 * float(policy_prior[action_code])
                     code_to_pair[action_code] = (action_slot0, action_slot1)
 
                 joint_candidates.append((joint_score, (action_slot0, action_slot1)))
@@ -590,6 +593,11 @@ class LookaheadSearch:
                 )
                 is_spread = simulated_move.is_spread or simulated_move.target in ("allAdjacentFoes", "allAdjacent") or is_expanding_force_spread
 
+                has_tablets_of_ruin = any(p.ability == "tabletsofruin" for p in all_active)
+                has_sword_of_ruin = any(p.ability == "swordofruin" for p in all_active)
+                has_vessel_of_ruin = any(p.ability == "vesselofruin" for p in all_active)
+                has_beads_of_ruin = any(p.ability == "beadsofruin" for p in all_active)
+
                 if is_spread:
                     if eff_priority > 0 and opp_blocks_priority:
                         continue
@@ -623,7 +631,26 @@ class LookaheadSearch:
                                     opp_field_mult *= 0.5
                                 if opp_eff_ability in ("filter", "solidrock", "prismarmor") and t_mult > 1.0:
                                     opp_field_mult *= 0.75
-                                est_dmg = eff_power * stab * opp_field_mult * t_mult * 0.75  # 0.75 spread damage penalty in Doubles
+                                attacker_stat = active_pokemon.calculate_effective_attack(
+                                    is_special, state.weather, state.fields, ignore_boosts=(opp_eff_ability == "unaware")
+                                )
+                                defender_stat = opp.calculate_effective_defense(
+                                    is_special, state.weather, state.fields,
+                                    ignore_boosts=(active_pokemon.ability == "unaware"),
+                                    ignore_ability=ignores_ability,
+                                )
+                                if not is_special:
+                                    if active_pokemon.ability != "tabletsofruin" and has_tablets_of_ruin:
+                                        attacker_stat *= 0.75
+                                    if opp.ability != "swordofruin" and has_sword_of_ruin:
+                                        defender_stat *= 0.75
+                                else:
+                                    if active_pokemon.ability != "vesselofruin" and has_vessel_of_ruin:
+                                        attacker_stat *= 0.75
+                                    if opp.ability != "beadsofruin" and has_beads_of_ruin:
+                                        defender_stat *= 0.75
+                                base_dmg = ((22.0 * eff_power * (attacker_stat / max(1.0, defender_stat))) / 50.0) + 2.0
+                                est_dmg = base_dmg * stab * opp_field_mult * t_mult * 0.75  # 0.75 spread damage penalty in Doubles
                                 if not charge_is_instant:
                                     est_dmg *= 0.45
                                 total_dmg_frac += min(1.5, est_dmg / max(opp.current_hp, 1.0))
@@ -694,7 +721,26 @@ class LookaheadSearch:
                                     opp_field_mult *= 0.5
                                 if opp_eff_ability in ("filter", "solidrock", "prismarmor") and type_mult > 1.0:
                                     opp_field_mult *= 0.75
-                                est_dmg = target_power * stab * opp_field_mult * type_mult
+                                attacker_stat = active_pokemon.calculate_effective_attack(
+                                    is_special, state.weather, state.fields, ignore_boosts=(opp_eff_ability == "unaware")
+                                )
+                                defender_stat = opponent_pokemon.calculate_effective_defense(
+                                    is_special, state.weather, state.fields,
+                                    ignore_boosts=(active_pokemon.ability == "unaware"),
+                                    ignore_ability=ignores_ability,
+                                )
+                                if not is_special:
+                                    if active_pokemon.ability != "tabletsofruin" and has_tablets_of_ruin:
+                                        attacker_stat *= 0.75
+                                    if opponent_pokemon.ability != "swordofruin" and has_sword_of_ruin:
+                                        defender_stat *= 0.75
+                                else:
+                                    if active_pokemon.ability != "vesselofruin" and has_vessel_of_ruin:
+                                        attacker_stat *= 0.75
+                                    if opponent_pokemon.ability != "beadsofruin" and has_beads_of_ruin:
+                                        defender_stat *= 0.75
+                                base_dmg = ((22.0 * target_power * (attacker_stat / max(1.0, defender_stat))) / 50.0) + 2.0
+                                est_dmg = base_dmg * stab * opp_field_mult * type_mult
                                 if not charge_is_instant:
                                     est_dmg *= 0.45
                                 dmg_frac = min(1.5, est_dmg / max(opponent_pokemon.current_hp, 1.0))
@@ -753,8 +799,9 @@ class LookaheadSearch:
                                     )
                 # High-Impact Speed & Field Control
                 elif mid == "trickroom":
+                    tr_score = 85.0 if "trickroom" not in state.fields else 20.0
                     slot_candidates.append(
-                        (85.0, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
+                        (tr_score, SimulatedAction("move", slot=slot, move_id=mid, target_idx=0, mega=False))
                     )
                 elif mid == "tailwind":
                     state_conditions = state.side_conditions if (active_pokemon and active_pokemon.side == 1) \
@@ -1015,10 +1062,13 @@ class LookaheadSearch:
         self,
         state: SimulatedBattleState,
         policy_prior: Optional[np.ndarray] = None,
+        collect_leaf_samples: int = 0,
     ) -> SearchResult:
         """
         Executes the multi-turn lookahead search to depth `self.depth`.
         Returns the optimal decision and game-theoretic value.
+        When `collect_leaf_samples > 0`, also populates `SearchResult.leaf_samples`
+        with stratified counterfactual Depth-1 states and their backed-up minimax values.
         """
         self.nodes_evaluated = 0
 
@@ -1041,13 +1091,22 @@ class LookaheadSearch:
             scored_candidates: list[tuple[float, tuple[SimulatedAction, SimulatedAction]]] = []
             dummy_opp = (SimulatedAction("pass", slot=0), SimulatedAction("pass", slot=1))
             next_states = [step_simulation(state, action, dummy_opp) for action in candidates]
-            
-            values_tensor = self.evaluator.evaluate(next_states)
-            values_np = values_tensor.detach().cpu().numpy()
-            
-            scored_candidates = [
-                (float(value), action) for value, action in zip(values_np, candidates)
-            ]
+
+            if len(candidates) == 1:
+                single_val = float(self.evaluator.evaluate(next_states[0]).item())
+                return SearchResult(
+                    best_action=candidates[0],
+                    value=single_val,
+                    action_distribution={candidates[0]: 1.0},
+                    predicted_opponent_actions={},
+                    depth=1,
+                    nodes_evaluated=1,
+                    method="force_switch",
+                )
+
+            for next_state, action in zip(next_states, candidates):
+                sub_val, _, _, _ = self._search_nash(next_state, depth=1, policy_prior=None)
+                scored_candidates.append((float(sub_val), action))
             scored_candidates.sort(key=lambda item: item[0], reverse=True)
             
             best_value, best_action = scored_candidates[0]
@@ -1062,8 +1121,13 @@ class LookaheadSearch:
                 method="force_switch",
             )
 
+        collected_leaf_samples: list[tuple[SimulatedBattleState, float]] = []
         game_value, best_nash_action, distribution_player1, distribution_player2 = self._search_nash(
-            state, depth=self.depth, policy_prior=policy_prior
+            state,
+            depth=self.depth,
+            policy_prior=policy_prior,
+            collect_leaf_samples=collect_leaf_samples,
+            leaf_samples_out=collected_leaf_samples,
         )
 
         resolved_action: tuple[SimulatedAction, SimulatedAction] = (
@@ -1079,6 +1143,7 @@ class LookaheadSearch:
             depth=self.depth,
             nodes_evaluated=self.nodes_evaluated,
             method="nash",
+            leaf_samples=collected_leaf_samples,
         )
 
     def _search_nash(
@@ -1086,6 +1151,8 @@ class LookaheadSearch:
         state: SimulatedBattleState,
         depth: int,
         policy_prior: Optional[np.ndarray] = None,
+        collect_leaf_samples: int = 0,
+        leaf_samples_out: Optional[list[tuple[SimulatedBattleState, float]]] = None,
     ) -> tuple[
         float,
         Optional[tuple[SimulatedAction, SimulatedAction]],
@@ -1135,10 +1202,14 @@ class LookaheadSearch:
         # because we skip evaluating terminal states
         leaf_states_to_evaluate: list[SimulatedBattleState] = []
         leaf_state_indices: list[tuple[int, int]] = []
+        should_collect_leaves = collect_leaf_samples > 0 and depth == self.depth and leaf_samples_out is not None
+        depth1_candidates: list[tuple[int, int, SimulatedBattleState]] = []
 
         for index_player1, action_player1 in enumerate(candidates_player1):
             for index_player2, action_player2 in enumerate(candidates_player2):
                 next_battle_state = step_simulation(state, action_player1, action_player2)
+                if should_collect_leaves and not next_battle_state.is_finished():
+                    depth1_candidates.append((index_player1, index_player2, next_battle_state))
                 if depth - 1 == 0 or next_battle_state.is_finished():
                     is_neural = hasattr(self.evaluator, "evaluate_batch")
                     win_val = 1.0 if is_neural else 100000.0
@@ -1167,6 +1238,18 @@ class LookaheadSearch:
             np_values = leaf_values.detach().cpu().numpy()
             for (index_player1, index_player2), leaf_value in zip(leaf_state_indices, np_values):
                 payoff_matrix[index_player1, index_player2] = leaf_value.item()
+
+        if should_collect_leaves and depth1_candidates and leaf_samples_out is not None:
+            scored_states = [
+                (float(np.clip(payoff_matrix[i, j], -1.0, 1.0)), candidate_state)
+                for i, j, candidate_state in depth1_candidates
+            ]
+            scored_states.sort(key=lambda item: item[0])
+            sample_count = min(collect_leaf_samples, len(scored_states))
+            selected_indices = np.linspace(0, len(scored_states) - 1, num=sample_count, dtype=int)
+            for idx in selected_indices:
+                sampled_value, sampled_state = scored_states[int(idx)]
+                leaf_samples_out.append((sampled_state, sampled_value))
 
         # Solve Nash equilibrium of payoff_matrix
         strategy_player1, strategy_player2, game_value = solve_zero_sum_matrix_game(payoff_matrix)
